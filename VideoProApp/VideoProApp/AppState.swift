@@ -53,10 +53,72 @@ final class AppState: ObservableObject {
     // MARK: - Lifecycle
 
     func start() {
+        checkInstallLocation()
         loadLibrary()
         refreshTools()
         requestNotifications()
         startServer()
+    }
+
+    // MARK: - Install location & installer cleanup
+
+    /// If we're running from a DMG or Downloads, offer to move to /Applications
+    /// (also required for Safari to load the extension). If already installed,
+    /// offer to eject leftover installer disk images.
+    func checkInstallLocation() {
+        let path = Bundle.main.bundlePath
+        if path.hasPrefix("/Applications/") {
+            offerEjectInstallers()
+            return
+        }
+        // Only nudge real distributions — never dev builds (DerivedData/Xcode).
+        guard path.hasPrefix("/Volumes/") || path.contains("/Downloads/") else { return }
+
+        let a = NSAlert()
+        a.messageText = "Move VideoPro to Applications?"
+        a.informativeText = "VideoPro should live in your Applications folder. Safari also needs it there to load the extension."
+        a.addButton(withTitle: "Move to Applications")
+        a.addButton(withTitle: "Not Now")
+        guard a.runModal() == .alertFirstButtonReturn else { return }
+        moveToApplications(from: path)
+    }
+
+    private func moveToApplications(from currentPath: String) {
+        let fm = FileManager.default
+        let dest = "/Applications/VideoPro.app"
+        do {
+            if fm.fileExists(atPath: dest) { try fm.removeItem(atPath: dest) }
+            try fm.copyItem(atPath: currentPath, toPath: dest)
+        } catch {
+            alert("Couldn’t move automatically",
+                  "Please drag VideoPro into your Applications folder yourself.\n\n\(error.localizedDescription)")
+            return
+        }
+        // Relaunch from /Applications; the fresh copy will offer to eject the installer.
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+        p.arguments = ["-n", dest]
+        try? p.run()
+        NSApp.terminate(nil)
+    }
+
+    private func offerEjectInstallers() {
+        let mounts = ((try? FileManager.default.contentsOfDirectory(atPath: "/Volumes")) ?? [])
+            .filter { $0 == "VideoPro" || $0.hasPrefix("VideoPro ") }
+        guard !mounts.isEmpty else { return }
+
+        let a = NSAlert()
+        a.messageText = "Eject the VideoPro installer?"
+        a.informativeText = "VideoPro is installed. You can eject the installer disk image\(mounts.count > 1 ? "s" : "") now to keep things tidy."
+        a.addButton(withTitle: "Eject")
+        a.addButton(withTitle: "Keep")
+        guard a.runModal() == .alertFirstButtonReturn else { return }
+        for name in mounts {
+            let p = Process()
+            p.executableURL = URL(fileURLWithPath: "/usr/bin/hdiutil")
+            p.arguments = ["detach", "/Volumes/\(name)", "-force"]
+            try? p.run(); p.waitUntilExit()
+        }
     }
 
     func refreshTools() {
