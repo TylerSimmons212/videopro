@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>VideoPro Demo Page</title>
+    <style>
+      body {
+        font-family: system-ui, sans-serif;
+        max-width: 800px;
+        margin: 40px auto;
+        padding: 0 16px;
+        background: #111;
+        color: #eee;
+      }
+      h1 {
+        font-weight: 700;
+      }
+      video,
+      audio {
+        width: 100%;
+        max-width: 640px;
+        background: #000;
+        border-radius: 8px;
+        margin: 12px 0 24px;
+      }
+      .note {
+        color: #999;
+        font-size: 14px;
+      }
+      code {
+        background: #222;
+        padding: 2px 6px;
+        border-radius: 4px;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>VideoPro demo</h1>
+    <p class="note">
+      Load the extension, open the side panel, and hit <strong>Refresh</strong>. You should see the
+      media below listed with controls.
+    </p>
+
+    <h2>Sample video (Big Buck Bunny)</h2>
+    <video
+      controls
+      crossorigin="anonymous"
+      poster="https://upload.wikimedia.org/wikipedia/commons/thumb/c/c5/Big_buck_bunny_poster_big.jpg/320px-Big_buck_bunny_poster_big.jpg"
+    >
+      <source
+        src="https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4"
+        type="video/mp4"
+      />
+      <!-- Sample VTT (inline data URL) -->
+      <track
+        kind="captions"
+        label="English"
+        srclang="en"
+        src="data:text/vtt,WEBVTT%0A%0A00%3A00%3A00.000%20--%3E%2000%3A00%3A03.000%0AWelcome%20to%20the%20VideoPro%20demo.%0A%0A00%3A00%3A03.500%20--%3E%2000%3A00%3A07.000%0ABig%20Buck%20Bunny%20is%20a%20Blender%20Foundation%20open%20movie."
+        default
+      />
+    </video>
+
+    <h2>Sample audio</h2>
+    <audio
+      controls
+      src="https://www.soundhelix.com/examples/mp3/SoundHelix-Song-1.mp3"
+    ></audio>
+
+    <h2>Second short clip</h2>
+    <video controls width="640">
+      <source
+        src="https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerBlazes.mp4"
+        type="video/mp4"
+      />
+    </video>
+
+    <p class="note">
+      Tip: play one video, filter with <code>Playing only</code>, try PiP, Download, and Transcript.
+    </p>
+  </body>
+</html>

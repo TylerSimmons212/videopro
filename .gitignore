@@ -1,0 +1,15 @@
+.DS_Store
+*.log
+node_modules/
+.idea/
+.vscode/
+*.crx
+*.pem
+
+# Build artifacts (large binaries)
+dist/
+VideoProApp/VideoProApp/bin/
+
+# Xcode user state
+xcuserdata/
+*.xcuserstate
