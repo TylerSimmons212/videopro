@@ -565,6 +565,8 @@ struct OnboardingView: View {
 // MARK: - Empty state
 
 struct EmptyStateView: View {
+    @EnvironmentObject var state: AppState
+
     var body: some View {
         VStack(spacing: 14) {
             Image(systemName: "tray.and.arrow.down.fill")
@@ -574,6 +576,20 @@ struct EmptyStateView: View {
             Text("Find a video in your browser and click **Send to VideoPro**.")
                 .font(.callout).foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
+
+            Divider().frame(width: 200).padding(.vertical, 4)
+
+            Text("Set up the browser extension")
+                .font(.caption).foregroundStyle(.secondary)
+            HStack(spacing: 10) {
+                Button { state.installExtension() } label: {
+                    Label("Chrome", systemImage: "puzzlepiece.extension.fill")
+                }
+                Button { state.openSafariExtensionSettings() } label: {
+                    Label("Safari", systemImage: "safari.fill")
+                }
+            }
+            .buttonStyle(.glass)
         }
         .padding(40)
         .glassEffect(.regular, in: .rect(cornerRadius: 24))
