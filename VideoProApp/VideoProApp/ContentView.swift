@@ -640,19 +640,46 @@ struct PlayerContext: Identifiable {
 struct PlayerSheet: View {
     let context: PlayerContext
     @Environment(\.dismiss) private var dismiss
+    @State private var player: AVPlayer
+
+    init(context: PlayerContext) {
+        self.context = context
+        _player = State(initialValue: AVPlayer(url: context.url))
+    }
 
     var body: some View {
         VStack(spacing: 0) {
             HStack {
                 Text(context.title).font(.headline).lineLimit(1)
                 Spacer()
-                Button("Done") { dismiss() }.buttonStyle(.glass)
+                Button("Done") { player.pause(); dismiss() }.buttonStyle(.glass)
             }
             .padding(12)
-            VideoPlayer(player: AVPlayer(url: context.url))
+            PlayerView(player: player)
                 .frame(minWidth: 720, minHeight: 405)
         }
         .frame(minWidth: 720, minHeight: 460)
         .background(.black)
+        .onAppear { player.play() }
+        .onDisappear { player.pause() }
+    }
+}
+
+/// AppKit AVPlayerView wrapped for SwiftUI. Using this instead of SwiftUI's
+/// `VideoPlayer` avoids a metadata crash in _AVKit_SwiftUI on some macOS builds.
+struct PlayerView: NSViewRepresentable {
+    let player: AVPlayer
+
+    func makeNSView(context: Context) -> AVPlayerView {
+        let view = AVPlayerView()
+        view.player = player
+        view.controlsStyle = .inline
+        view.videoGravity = .resizeAspect
+        view.showsFullScreenToggleButton = true
+        return view
+    }
+
+    func updateNSView(_ nsView: AVPlayerView, context: Context) {
+        if nsView.player !== player { nsView.player = player }
     }
 }
