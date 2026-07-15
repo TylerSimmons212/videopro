@@ -393,15 +393,18 @@ struct SettingsPopover: View {
 
             Divider()
 
-            VStack(alignment: .leading, spacing: 6) {
+            VStack(alignment: .leading, spacing: 8) {
                 Text("Browser extension").font(.caption).foregroundStyle(.secondary)
-                HStack {
-                    Text("Detect & send videos from your browser")
-                        .font(.caption).foregroundStyle(.secondary)
+                Text("Detect & send videos from your browser")
+                    .font(.caption2).foregroundStyle(.secondary)
+                HStack(spacing: 8) {
+                    Button("Chrome…") { state.installExtension() }
+                        .help("Save the extension and load it unpacked in Chrome")
+                    Button("Enable in Safari") { state.openSafariExtensionSettings() }
+                        .help("Open Safari’s Extensions settings")
                     Spacer()
-                    Button("Get the extension…") { state.installExtension() }
-                        .controlSize(.small)
                 }
+                .controlSize(.small)
             }
 
             Divider()
@@ -536,6 +539,12 @@ struct OnboardingView: View {
                             .frame(maxWidth: .infinity)
                     }
                     .buttonStyle(.glassProminent).tint(.purple).controlSize(.large)
+
+                    Button("Using Safari? Enable it there instead") {
+                        state.openSafariExtensionSettings()
+                    }
+                    .buttonStyle(.glass).controlSize(.small)
+                    .frame(maxWidth: .infinity)
                 }
                 .padding(16)
                 .glassEffect(.regular, in: .rect(cornerRadius: 16))

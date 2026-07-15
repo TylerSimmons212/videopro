@@ -3,6 +3,7 @@ import Combine
 import SwiftUI
 import AppKit
 import UserNotifications
+import SafariServices
 
 @MainActor
 final class AppState: ObservableObject {
@@ -366,6 +367,18 @@ final class AppState: ObservableObject {
 
         NSWorkspace.shared.activateFileViewerSelecting([dest])
         showInstallSteps(folder: dest)
+    }
+
+    /// Jump straight to Safari's Extensions settings so the user can enable the
+    /// bundled Safari Web Extension.
+    func openSafariExtensionSettings() {
+        SFSafariApplication.showPreferencesForExtension(withIdentifier: "com.videopro.app.safari") { [weak self] error in
+            guard let error else { return }
+            Task { @MainActor in
+                self?.alert("Couldn’t open Safari settings",
+                            "Open Safari → Settings → Extensions and enable VideoPro.\n\n\(error.localizedDescription)")
+            }
+        }
     }
 
     private func showInstallSteps(folder: URL) {
