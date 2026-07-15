@@ -84,10 +84,16 @@ Downloads the **official yt-dlp** + a **static, arch-matched ffmpeg**, builds th
 app with them embedded in `Contents/Resources/bin/`, ad-hoc signs it, and produces
 `dist/VideoPro.dmg` — which runs on any Mac **without Homebrew**.
 
-For frictionless distribution to anyone, notarize with your **Apple Developer ID**
-(enable Hardened Runtime first). The exact `notarytool` commands are printed by the
-packaging script. Until notarized, recipients right-click → **Open** once to bypass
-Gatekeeper's "unidentified developer" prompt.
+For frictionless distribution to anyone, notarize with your **Apple Developer ID**:
+```bash
+# one-time: store a fresh app-specific password (you run this, so you type it)
+xcrun notarytool store-credentials VIDEOPRO \
+  --apple-id "<you@example.com>" --team-id "<TEAMID>" --password "<app-specific-pw>"
+
+bash scripts/notarize.sh   # signs (hardened runtime + entitlements), submits, staples
+```
+Until notarized, recipients right-click → **Open** once to bypass Gatekeeper's
+"unidentified developer" prompt.
 
 ## Limitations
 
