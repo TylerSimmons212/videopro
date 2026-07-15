@@ -6,9 +6,46 @@
 	objectVersion = 90;
 	objects = {
 
+/* Begin PBXBuildFile section */
+		99AE13F930078A9C0060FEBC /* safari.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = 99AE13E130078A9C0060FEBC /* safari.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
+/* End PBXBuildFile section */
+
+/* Begin PBXContainerItemProxy section */
+		99AE13F730078A9C0060FEBC /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 000000000000000000000000 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 99AE13E030078A9C0060FEBC;
+			remoteInfo = safari;
+		};
+/* End PBXContainerItemProxy section */
+
+/* Begin PBXCopyFilesBuildPhase section */
+		99AE13FA30078A9C0060FEBC /* Embed Foundation Extensions */ = {
+			isa = PBXCopyFilesBuildPhase;
+			dstPath = "";
+			dstSubfolder = PlugIns;
+			files = (
+				99AE13F930078A9C0060FEBC /* safari.appex in Embed Foundation Extensions */,
+			);
+			name = "Embed Foundation Extensions";
+		};
+/* End PBXCopyFilesBuildPhase section */
+
 /* Begin PBXFileReference section */
 		000000000000000000000120 /* VideoProApp.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = VideoProApp.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		99AE13E130078A9C0060FEBC /* safari.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = safari.appex; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
+
+/* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
+		99AE13FD30078A9C0060FEBC /* Exceptions for "safari" folder in "safari" target */ = {
+			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
+			membershipExceptions = (
+				Info.plist,
+			);
+			target = 99AE13E030078A9C0060FEBC /* safari */;
+		};
+/* End PBXFileSystemSynchronizedBuildFileExceptionSet section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
 		000000000000000000000010 /* VideoProApp */ = {
@@ -16,10 +53,27 @@
 			path = VideoProApp;
 			sourceTree = "<group>";
 		};
+		99AE13E230078A9C0060FEBC /* safari */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			exceptions = (
+				99AE13FD30078A9C0060FEBC /* Exceptions for "safari" folder in "safari" target */,
+			);
+			explicitFolders = (
+				Resources/_locales,
+				Resources/images,
+			);
+			path = safari;
+			sourceTree = "<group>";
+		};
 /* End PBXFileSystemSynchronizedRootGroup section */
 
 /* Begin PBXFrameworksBuildPhase section */
 		000000000000000130000000 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			files = (
+			);
+		};
+		99AE13DE30078A9C0060FEBC /* Frameworks */ = {
 			isa = PBXFrameworksBuildPhase;
 			files = (
 			);
@@ -31,6 +85,7 @@
 			isa = PBXGroup;
 			children = (
 				000000000000000000000010 /* VideoProApp */,
+				99AE13E230078A9C0060FEBC /* safari */,
 				000000000000000000000020 /* Products */,
 			);
 			sourceTree = "<group>";
@@ -39,6 +94,7 @@
 			isa = PBXGroup;
 			children = (
 				000000000000000000000120 /* VideoProApp.app */,
+				99AE13E130078A9C0060FEBC /* safari.appex */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -53,8 +109,12 @@
 				000000000000000120000000 /* Sources */,
 				000000000000000130000000 /* Frameworks */,
 				000000000000000140000000 /* Resources */,
+				99AE13FA30078A9C0060FEBC /* Embed Foundation Extensions */,
 			);
 			buildRules = (
+			);
+			dependencies = (
+				99AE13F830078A9C0060FEBC /* PBXTargetDependency */,
 			);
 			fileSystemSynchronizedGroups = (
 				000000000000000000000010 /* VideoProApp */,
@@ -64,6 +124,24 @@
 			productReference = 000000000000000000000120 /* VideoProApp.app */;
 			productType = "com.apple.product-type.application";
 		};
+		99AE13E030078A9C0060FEBC /* safari */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 99AE13FE30078A9C0060FEBC /* Build configuration list for PBXNativeTarget "safari" */;
+			buildPhases = (
+				99AE13DD30078A9C0060FEBC /* Sources */,
+				99AE13DE30078A9C0060FEBC /* Frameworks */,
+				99AE13DF30078A9C0060FEBC /* Resources */,
+			);
+			buildRules = (
+			);
+			fileSystemSynchronizedGroups = (
+				99AE13E230078A9C0060FEBC /* safari */,
+			);
+			name = safari;
+			productName = safari;
+			productReference = 99AE13E130078A9C0060FEBC /* safari.appex */;
+			productType = "com.apple.product-type.app-extension";
+		};
 /* End PBXNativeTarget section */
 
 /* Begin PBXProject section */
@@ -71,11 +149,14 @@
 			isa = PBXProject;
 			attributes = {
 				BuildIndependentTargetsInParallel = 1;
-				LastSwiftUpdateCheck = 2630;
+				LastSwiftUpdateCheck = 2700;
 				LastUpgradeCheck = 2700;
 				TargetAttributes = {
 					000000000000000100000000 = {
 						CreatedOnToolsVersion = 26.3;
+					};
+					99AE13E030078A9C0060FEBC = {
+						CreatedOnToolsVersion = 27.0;
 					};
 				};
 			};
@@ -94,12 +175,18 @@
 			projectRoot = "";
 			targets = (
 				000000000000000100000000 /* VideoProApp */,
+				99AE13E030078A9C0060FEBC /* safari */,
 			);
 		};
 /* End PBXProject section */
 
 /* Begin PBXResourcesBuildPhase section */
 		000000000000000140000000 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			files = (
+			);
+		};
+		99AE13DF30078A9C0060FEBC /* Resources */ = {
 			isa = PBXResourcesBuildPhase;
 			files = (
 			);
@@ -112,7 +199,20 @@
 			files = (
 			);
 		};
+		99AE13DD30078A9C0060FEBC /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			files = (
+			);
+		};
 /* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		99AE13F830078A9C0060FEBC /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 99AE13E030078A9C0060FEBC /* safari */;
+			targetProxy = 99AE13F730078A9C0060FEBC /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
 
 /* Begin XCBuildConfiguration section */
 		000000000000000011000000 /* Debug configuration for PBXProject "VideoProApp" */ = {
@@ -333,6 +433,76 @@
 			};
 			name = Release;
 		};
+		99AE13FB30078A9C0060FEBC /* Debug configuration for PBXNativeTarget "safari" */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				ENABLE_APP_SANDBOX = YES;
+				ENABLE_HARDENED_RUNTIME = YES;
+				ENABLE_USER_SELECTED_FILES = readonly;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = safari/Info.plist;
+				INFOPLIST_KEY_CFBundleDisplayName = safari;
+				INFOPLIST_KEY_NSHumanReadableCopyright = "";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+					"@executable_path/../../../../Frameworks",
+				);
+				MACOSX_DEPLOYMENT_TARGET = 27.0;
+				MARKETING_VERSION = 1.0;
+				OTHER_LDFLAGS = (
+					"-framework",
+					SafariServices,
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.videopro.app.safari;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = macosx;
+				SKIP_INSTALL = YES;
+				STRING_CATALOG_GENERATE_SYMBOLS = YES;
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+			};
+			name = Debug;
+		};
+		99AE13FC30078A9C0060FEBC /* Release configuration for PBXNativeTarget "safari" */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				ENABLE_APP_SANDBOX = YES;
+				ENABLE_HARDENED_RUNTIME = YES;
+				ENABLE_USER_SELECTED_FILES = readonly;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = safari/Info.plist;
+				INFOPLIST_KEY_CFBundleDisplayName = safari;
+				INFOPLIST_KEY_NSHumanReadableCopyright = "";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+					"@executable_path/../../../../Frameworks",
+				);
+				MACOSX_DEPLOYMENT_TARGET = 27.0;
+				MARKETING_VERSION = 1.0;
+				OTHER_LDFLAGS = (
+					"-framework",
+					SafariServices,
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.videopro.app.safari;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = macosx;
+				SKIP_INSTALL = YES;
+				STRING_CATALOG_GENERATE_SYMBOLS = YES;
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+			};
+			name = Release;
+		};
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
@@ -349,6 +519,14 @@
 			buildConfigurations = (
 				000000000000000111000000 /* Debug configuration for PBXNativeTarget "VideoProApp" */,
 				000000000000000112000000 /* Release configuration for PBXNativeTarget "VideoProApp" */,
+			);
+			defaultConfigurationName = Release;
+		};
+		99AE13FE30078A9C0060FEBC /* Build configuration list for PBXNativeTarget "safari" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				99AE13FB30078A9C0060FEBC /* Debug configuration for PBXNativeTarget "safari" */,
+				99AE13FC30078A9C0060FEBC /* Release configuration for PBXNativeTarget "safari" */,
 			);
 			defaultConfigurationName = Release;
 		};

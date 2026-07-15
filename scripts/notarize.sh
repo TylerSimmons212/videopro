@@ -46,6 +46,13 @@ codesign --force --timestamp --options runtime --entitlements "$ENT" -s "$DEV_ID
 codesign --force --timestamp --options runtime                        -s "$DEV_ID" "$APP/Contents/Resources/bin/ffmpeg"
 codesign --force --timestamp --options runtime                        -s "$DEV_ID" "$APP/Contents/Resources/bin/ffprobe"
 
+# Sign the embedded Safari extension (nested code must be signed before the app).
+APPEX="$APP/Contents/PlugIns/safari.appex"
+if [ -d "$APPEX" ]; then
+  echo "→ signing the Safari extension…"
+  codesign --force --timestamp --options runtime --preserve-metadata=entitlements -s "$DEV_ID" "$APPEX"
+fi
+
 echo "→ signing the app…"
 codesign --force --timestamp --options runtime -s "$DEV_ID" "$APP"
 codesign --verify --strict --verbose=2 "$APP"

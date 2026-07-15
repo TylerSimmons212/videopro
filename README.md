@@ -70,8 +70,14 @@ brew install yt-dlp ffmpeg     # or bundle them (see Distribution)
 open VideoProApp/VideoProApp.xcodeproj   # then ⌘R
 ```
 
-**Extension** — `chrome://extensions` → Developer mode → **Load unpacked** → select
-`extension/`. (Or launch the app and use its onboarding / **Settings → Get the extension…**.)
+**Chrome extension** — `chrome://extensions` → Developer mode → **Load unpacked** →
+select `extension/`. (Or launch the app and use its onboarding / **Settings → Get
+the extension…**.)
+
+**Safari extension** — the app bundles a Safari Web Extension (`VideoProApp/safari/`,
+same code as the Chrome one). Build/run the app, then enable it in **Safari → Settings
+→ Extensions**. After editing `extension/`, run `bash scripts/sync-safari.sh` to keep
+them in sync, then rebuild.
 
 Open a page with a video → click a card to pop it out, or **Send** it to the app.
 
