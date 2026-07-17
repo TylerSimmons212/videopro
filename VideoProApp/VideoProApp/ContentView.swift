@@ -1,5 +1,6 @@
 import SwiftUI
 import AVKit
+import Combine
 
 struct ContentView: View {
     @EnvironmentObject var state: AppState
@@ -129,13 +130,16 @@ struct ContentView: View {
     }
 
     private func play(_ item: VideoItem) {
-        if item.meta.isDirectlyPlayable, let url = URL(string: item.meta.mediaURL) {
+        // Warmed on arrival (or already downloaded) — open with zero latency.
+        if let url = item.warmPlayURL {
             playerItem = PlayerContext(url: url, title: item.meta.title)
             return
         }
+        // Cold: never warmed, or the signed URL aged out. Resolve and re-cache.
         item.statusLine = "Resolving stream…"
         Task {
             if let url = await DownloadManager.shared.resolvePlayableURL(for: item.meta) {
+                item.setPlayURL(url, expires: DownloadManager.expiry(for: url.absoluteString))
                 playerItem = PlayerContext(url: url, title: item.meta.title)
                 item.statusLine = ""
             } else {
@@ -240,6 +244,12 @@ struct VideoCard: View {
         default:
             if !item.statusLine.isEmpty {
                 Text(item.statusLine).font(.caption2).foregroundStyle(.secondary)
+            } else if item.readyToPlay {
+                Label("Ready to play", systemImage: "bolt.fill")
+                    .font(.caption2).foregroundStyle(.secondary)
+            } else if item.probing {
+                Label("Getting ready…", systemImage: "arrow.triangle.2.circlepath")
+                    .font(.caption2).foregroundStyle(.secondary)
             }
         }
     }
@@ -260,12 +270,6 @@ struct VideoCard: View {
                 .buttonStyle(.glass)
                 .help(item.status == .queued ? "Remove from queue" : "Cancel")
             case .done:
-                Button(action: onExport) {
-                    Image(systemName: "wand.and.stars").frame(width: 34, height: 30)
-                }
-                .buttonStyle(.glass)
-                .help("Convert / trim…")
-                .disabled(item.busy)
                 Button { state.revealInFinder(item) } label: {
                     Image(systemName: "folder.fill").frame(width: 34, height: 30)
                 }
@@ -288,6 +292,17 @@ struct VideoCard: View {
                     }
                     .environmentObject(state)
                 }
+            }
+
+            // Clip / GIF / MP3 are available from the start — no need to download
+            // the full video first; the export fetches its own source if needed.
+            if item.status != .downloading, item.status != .queued {
+                Button(action: onExport) {
+                    Image(systemName: "wand.and.stars").frame(width: 34, height: 30)
+                }
+                .buttonStyle(.glass)
+                .help("Clip · GIF · MP3…")
+                .disabled(item.busy || !state.canExport(item))
             }
 
             Button { state.remove(item) } label: {
@@ -393,19 +408,7 @@ struct SettingsPopover: View {
 
             Divider()
 
-            VStack(alignment: .leading, spacing: 8) {
-                Text("Browser extension").font(.caption).foregroundStyle(.secondary)
-                Text("Detect & send videos from your browser")
-                    .font(.caption2).foregroundStyle(.secondary)
-                HStack(spacing: 8) {
-                    Button("Chrome…") { state.installExtension() }
-                        .help("Save the extension and load it unpacked in Chrome")
-                    Button("Enable in Safari") { state.openSafariExtensionSettings() }
-                        .help("Open Safari’s Extensions settings")
-                    Spacer()
-                }
-                .controlSize(.small)
-            }
+            ExtensionSetupView()
 
             Divider()
 
@@ -474,6 +477,11 @@ struct ConvertSheet: View {
                     .font(.caption).foregroundStyle(.secondary)
             }
 
+            if !state.hasLocalFile(item) {
+                Label(sourceNote, systemImage: "arrow.down.circle")
+                    .font(.caption2).foregroundStyle(.secondary)
+            }
+
             HStack {
                 Spacer()
                 Button("Cancel") { dismiss() }
@@ -496,6 +504,17 @@ struct ConvertSheet: View {
         return "end"
     }
 
+    /// This video isn't downloaded, so say what we'll pull down for the export.
+    private var sourceNote: String {
+        switch kind {
+        case .audio: return "Not downloaded — VideoPro will fetch the audio track only."
+        case .trim, .gif:
+            return endText.isEmpty
+                ? "Not downloaded — VideoPro will fetch the video first."
+                : "Not downloaded — VideoPro will fetch just this section."
+        }
+    }
+
     private func parseTime(_ s: String) -> Double {
         let parts = s.split(separator: ":").map { Double($0) ?? 0 }
         switch parts.count {
@@ -507,12 +526,202 @@ struct ConvertSheet: View {
     }
 }
 
+// MARK: - Extension setup
+
+/// Lists the browsers actually installed on this Mac and sets the extension up in
+/// the one you pick.
+///
+/// The old flow hard-coded "Chrome" and told you to open `chrome://extensions` —
+/// useless if you don't have Chrome (Arc, Brave and Edge users got no working path
+/// at all). It also never told you whether setup had actually worked.
+struct ExtensionSetupView: View {
+    @EnvironmentObject var state: AppState
+    @State private var chromium: [BrowserTarget] = []
+    @State private var safari: BrowserTarget?
+    @State private var sheetBrowser: BrowserTarget?
+    /// Ticks so "last seen" stays honest while the popover is open.
+    @State private var now = Date()
+    private let tick = Timer.publish(every: 5, on: .main, in: .common).autoconnect()
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 9) {
+            Text("Browser extension").font(.caption).foregroundStyle(.secondary)
+
+            // Say plainly whether it's working — no guessing.
+            HStack(spacing: 7) {
+                Circle()
+                    .fill(state.extensionStatus.connected ? Color.green : Color.secondary.opacity(0.5))
+                    .frame(width: 8, height: 8)
+                Text(state.extensionStatus.text).font(.caption)
+                    .foregroundStyle(state.extensionStatus.connected ? .primary : .secondary)
+            }
+
+            if chromium.isEmpty && safari == nil {
+                Text("No supported browser found.")
+                    .font(.caption2).foregroundStyle(.secondary)
+            }
+
+            ForEach(chromium) { b in
+                browserRow(
+                    name: b.name,
+                    detail: "Guided setup — takes about 20 seconds",
+                    action: { sheetBrowser = b },
+                    label: "Set up…"
+                )
+            }
+
+            if let s = safari {
+                browserRow(
+                    name: s.name,
+                    detail: "Enable in Safari’s Extensions settings",
+                    action: { state.openSafariExtensionSettings() },
+                    label: "Enable…"
+                )
+            }
+
+            Text(state.extensionFolder.path)
+                .font(.system(size: 9, design: .monospaced))
+                .foregroundStyle(.tertiary)
+                .lineLimit(1).truncationMode(.middle)
+                .textSelection(.enabled)
+        }
+        .onAppear {
+            chromium = BrowserScan.chromiumInstalled()
+            safari = BrowserScan.safariInstalled()
+        }
+        .onReceive(tick) { now = $0 }
+        .sheet(item: $sheetBrowser) { b in
+            ExtensionInstallSheet(browser: b).environmentObject(state)
+        }
+    }
+
+    @ViewBuilder
+    private func browserRow(name: String, detail: String,
+                            action: @escaping () -> Void, label: String) -> some View {
+        HStack(spacing: 8) {
+            VStack(alignment: .leading, spacing: 1) {
+                Text(name).font(.caption).fontWeight(.medium)
+                Text(detail).font(.system(size: 10)).foregroundStyle(.secondary)
+            }
+            Spacer()
+            Button(label, action: action).controlSize(.small)
+        }
+    }
+}
+
+/// Guided "Load unpacked" flow.
+///
+/// Chromium's Load-unpacked button opens a bare folder picker with no idea where
+/// to go — and our folder lives in ~/Library, which Finder hides by default. So
+/// we spell out the two ways that actually work (⌘⇧G + paste, or drag from the
+/// Finder window we open) and confirm when the extension connects.
+struct ExtensionInstallSheet: View {
+    @EnvironmentObject var state: AppState
+    let browser: BrowserTarget
+    @Environment(\.dismiss) private var dismiss
+    @State private var copied = false
+    @State private var now = Date()
+    private let tick = Timer.publish(every: 2, on: .main, in: .common).autoconnect()
+
+    private var connected: Bool { state.extensionStatus.connected }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(spacing: 9) {
+                Image(systemName: "puzzlepiece.extension.fill")
+                    .font(.title2).foregroundStyle(.purple)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("Set up in \(browser.name)").font(.title3).fontWeight(.bold)
+                    Text("VideoPro opened \(browser.name)’s Extensions page and copied the folder path.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+            }
+
+            VStack(alignment: .leading, spacing: 9) {
+                step(1, "Turn on **Developer mode** — the toggle at the top-right.")
+                step(2, "Click **Load unpacked**. A folder picker opens.")
+                step(3, "Press **⌘⇧G**, paste with **⌘V**, then hit **Return**.")
+                HStack(spacing: 6) {
+                    Image(systemName: "arrow.turn.down.right").foregroundStyle(.tertiary)
+                    Text("Or drag the folder from the Finder window onto the Extensions page.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                .padding(.leading, 22)
+            }
+
+            HStack(spacing: 6) {
+                Text(state.extensionFolder.path)
+                    .font(.system(size: 10, design: .monospaced))
+                    .lineLimit(1).truncationMode(.head)
+                    .textSelection(.enabled)
+                Spacer()
+                Button(copied ? "Copied ✓" : "Copy path") {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(state.extensionFolder.path, forType: .string)
+                    copied = true
+                }
+                .controlSize(.small)
+            }
+            .padding(8)
+            .background(.quaternary.opacity(0.4), in: .rect(cornerRadius: 7))
+
+            // Closes the loop: the popup pings /health on open, so this flips
+            // green on its own the moment it's really working.
+            HStack(spacing: 7) {
+                if connected {
+                    Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
+                    Text("Connected — you’re all set.").font(.callout).fontWeight(.medium)
+                } else {
+                    ProgressView().controlSize(.small)
+                    Text("Waiting for the extension to connect…")
+                        .font(.callout).foregroundStyle(.secondary)
+                }
+            }
+
+            HStack {
+                Button("Reveal folder") {
+                    NSWorkspace.shared.activateFileViewerSelecting([state.extensionFolder])
+                }
+                Button("Reopen \(browser.name)") { state.setUpExtension(in: browser) }
+                Spacer()
+                Button(connected ? "Done" : "Close") { dismiss() }
+                    .buttonStyle(.borderedProminent)
+                    .keyboardShortcut(.defaultAction)
+            }
+            .controlSize(.small)
+        }
+        .padding(20)
+        .frame(width: 460)
+        .onAppear {
+            // Unpack + open the browser + copy the path as the sheet appears, so
+            // the steps below are true by the time the user reads them.
+            state.setUpExtension(in: browser)
+            copied = true
+        }
+        .onReceive(tick) { now = $0 }
+    }
+
+    @ViewBuilder
+    private func step(_ n: Int, _ markdown: String) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Text("\(n)")
+                .font(.caption2).fontWeight(.bold).foregroundStyle(.white)
+                .frame(width: 16, height: 16)
+                .background(.purple, in: .circle)
+            Text(.init(markdown)).font(.callout)
+        }
+    }
+}
+
 // MARK: - Onboarding
 
 struct OnboardingView: View {
     @EnvironmentObject var state: AppState
     let onDone: () -> Void
     @State private var installed = false
+    @State private var chromium: [BrowserTarget] = []
+    @State private var safari: BrowserTarget?
+    @State private var sheetBrowser: BrowserTarget?
 
     var body: some View {
         ZStack {
@@ -528,26 +737,49 @@ struct OnboardingView: View {
                 VStack(alignment: .leading, spacing: 10) {
                     Label("Install the browser extension", systemImage: "puzzlepiece.extension.fill")
                         .font(.headline)
-                    Text("Adds video detection and a “Send to VideoPro” button to any page. It saves to your Downloads — then load it unpacked (steps included).")
+                    Text("Adds video detection and a “Send to VideoPro” button to any page. Pick your browser — VideoPro opens it and copies the folder path for you.")
                         .font(.caption).foregroundStyle(.secondary)
-                    Button {
-                        state.installExtension()
-                        installed = true
-                    } label: {
-                        Label(installed ? "Saved — follow the steps in Finder" : "Install browser extension",
-                              systemImage: installed ? "checkmark.circle.fill" : "arrow.down.circle.fill")
-                            .frame(maxWidth: .infinity)
-                    }
-                    .buttonStyle(.glassProminent).tint(.purple).controlSize(.large)
 
-                    Button("Using Safari? Enable it there instead") {
-                        state.openSafariExtensionSettings()
+                    // Offer the browsers actually on this Mac. Hard-coding "Chrome"
+                    // left Arc/Brave/Edge users with no working path at all.
+                    ForEach(chromium) { b in
+                        Button {
+                            sheetBrowser = b
+                            installed = true
+                        } label: {
+                            Label("Install in \(b.name)", systemImage: "arrow.down.circle.fill")
+                                .frame(maxWidth: .infinity)
+                        }
+                        .buttonStyle(.glassProminent).tint(.purple).controlSize(.large)
                     }
-                    .buttonStyle(.glass).controlSize(.small)
-                    .frame(maxWidth: .infinity)
+
+                    if safari != nil {
+                        Button("Using Safari? Enable it there instead") {
+                            state.openSafariExtensionSettings()
+                            installed = true
+                        }
+                        .buttonStyle(.glass).controlSize(.small)
+                        .frame(maxWidth: .infinity)
+                    }
+
+                    if chromium.isEmpty && safari == nil {
+                        Text("No supported browser found. Install Chrome, Arc, Brave, Edge, or use Safari.")
+                            .font(.caption2).foregroundStyle(.orange)
+                    }
+
+                    if installed {
+                        Label("Follow the steps in your browser — this turns green once it connects",
+                              systemImage: state.extensionStatus.connected ? "checkmark.circle.fill" : "info.circle")
+                            .font(.caption2)
+                            .foregroundStyle(state.extensionStatus.connected ? .green : .secondary)
+                    }
                 }
                 .padding(16)
                 .glassEffect(.regular, in: .rect(cornerRadius: 16))
+                .onAppear {
+                    chromium = BrowserScan.chromiumInstalled()
+                    safari = BrowserScan.safariInstalled()
+                }
 
                 Label(state.toolSummary, systemImage: state.toolsReady ? "checkmark.seal.fill" : "exclamationmark.triangle.fill")
                     .font(.caption).foregroundStyle(state.toolsReady ? .green : .orange)
@@ -559,6 +791,9 @@ struct OnboardingView: View {
             .padding(28)
         }
         .frame(width: 440, height: 500)
+        .sheet(item: $sheetBrowser) { b in
+            ExtensionInstallSheet(browser: b).environmentObject(state)
+        }
     }
 }
 
@@ -582,11 +817,16 @@ struct EmptyStateView: View {
             Text("Set up the browser extension")
                 .font(.caption).foregroundStyle(.secondary)
             HStack(spacing: 10) {
-                Button { state.installExtension() } label: {
-                    Label("Chrome", systemImage: "puzzlepiece.extension.fill")
+                // Only offer browsers that exist on this Mac.
+                ForEach(BrowserScan.chromiumInstalled()) { b in
+                    Button { state.setUpExtension(in: b) } label: {
+                        Label(b.name, systemImage: "puzzlepiece.extension.fill")
+                    }
                 }
-                Button { state.openSafariExtensionSettings() } label: {
-                    Label("Safari", systemImage: "safari.fill")
+                if BrowserScan.safariInstalled() != nil {
+                    Button { state.openSafariExtensionSettings() } label: {
+                        Label("Safari", systemImage: "safari.fill")
+                    }
                 }
             }
             .buttonStyle(.glass)

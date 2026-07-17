@@ -179,7 +179,95 @@
     }
   }
 
+  // ─── App handoff via the videopro:// URL scheme ────────────────────────────
+  //
+  // Safari does not let an extension reach 127.0.0.1, so the POST to the local
+  // server that works in Chrome always fails there. macOS will still route our
+  // registered custom scheme to the app (launching it if needed), so we encode
+  // the payload into a videopro://add URL as a fallback.
+  //
+  // Exposed on `window` because content scripts of the same extension share one
+  // isolated world — focus.js reuses this rather than duplicating it.
+
+  const SCHEME_URL_LIMIT = 8000; // stay well clear of any URL length ceiling
+
+  function b64url(str) {
+    // btoa() is latin1-only; encode UTF-8 by hand so non-ASCII titles survive.
+    const bytes = new TextEncoder().encode(str);
+    let bin = "";
+    for (const b of bytes) bin += String.fromCharCode(b);
+    return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  }
+
+  function encodeSchemeURL(payload) {
+    // Deliberately drop thumbnails: base64 frames are enormous and would blow the
+    // URL limit. The app fetches a better one via yt-dlp during enrichment anyway.
+    const slim = {
+      pageUrl: payload.pageUrl || "",
+      pageTitle: payload.pageTitle || "",
+      videos: (payload.videos || []).map((v) => ({
+        title: v.title || "",
+        pageUrl: v.pageUrl || "",
+        pageTitle: v.pageTitle || "",
+        mediaUrl: v.mediaUrl || v.primarySrc || "",
+        srcKind: v.srcKind || "stream",
+        duration: typeof v.duration === "number" ? v.duration : null,
+        width: v.width || 0,
+        height: v.height || 0,
+        platform: v.platform || null,
+      })),
+    };
+    return `videopro://add?v=${b64url(JSON.stringify(slim))}`;
+  }
+
+  function openScheme(url) {
+    // Navigate a hidden iframe rather than the page — `location = "videopro://"`
+    // would blank out whatever the user was watching.
+    try {
+      const f = document.createElement("iframe");
+      f.style.display = "none";
+      f.src = url;
+      (document.body || document.documentElement).appendChild(f);
+      setTimeout(() => f.remove(), 2000);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  function sendViaScheme(payload) {
+    // NB: no top-frame guard here on purpose. focus.js legitimately calls this
+    // from whichever frame owns the video (an embedded player lives in an
+    // iframe), and that frame's location.href is the correct page for it. The
+    // duplicate-launch risk comes from *broadcasting*, which the popup avoids by
+    // targeting frameId 0.
+    let url = encodeSchemeURL(payload);
+    if (url.length > SCHEME_URL_LIMIT) {
+      // Too long (usually a huge signed media URL). Fall back to just the page —
+      // yt-dlp can resolve it from that alone.
+      url = encodeSchemeURL({
+        pageUrl: payload.pageUrl,
+        pageTitle: payload.pageTitle,
+        videos: [
+          {
+            title: payload.pageTitle || location.hostname,
+            pageUrl: payload.pageUrl || location.href,
+            srcKind: "page",
+          },
+        ],
+      });
+    }
+    return openScheme(url);
+  }
+
+  window.__videoproSendViaScheme = sendViaScheme;
+
   // ─── Resource / Performance scan (complements webRequest) ──────────────────
+
+  // A long HLS/DASH session emits thousands of segment URLs. We only ever need a
+  // recent window of them, and every publish() stringifies this map — so cap it
+  // (oldest out first) instead of letting it grow for the life of the tab.
+  const MAX_RESOURCE_URLS = 300;
 
   function noteResource(url, mimeType = "") {
     if (!isInterestingMediaUrl(url)) return;
@@ -187,18 +275,29 @@
       const abs = new URL(url, location.href).href;
       if (!resourceUrls.has(abs)) {
         resourceUrls.set(abs, { url: abs, mimeType });
+        while (resourceUrls.size > MAX_RESOURCE_URLS) {
+          resourceUrls.delete(resourceUrls.keys().next().value);
+        }
       }
     } catch {
       /* */
     }
   }
 
+  // performance.getEntriesByType("resource") returns the whole buffer every call,
+  // so re-reading it from index 0 on a timer means O(n²) work over a session.
+  // Only look at entries we haven't seen yet.
+  let perfCursor = 0;
   function scanPerformanceResources() {
     try {
       const entries = performance.getEntriesByType("resource");
-      for (const e of entries) {
+      for (let i = perfCursor; i < entries.length; i++) {
+        const e = entries[i];
         noteResource(e.name, e.initiatorType === "video" ? "video/*" : "");
       }
+      perfCursor = entries.length;
+      // The buffer can be cleared by the page; don't strand the cursor past its end.
+      if (perfCursor > entries.length) perfCursor = 0;
     } catch {
       /* */
     }
@@ -396,35 +495,75 @@
     if (type === "video") scheduleThumb(el, entry);
   }
 
-  function scan(root = document) {
-    if (!root || !root.querySelectorAll) return;
+  /**
+   * Walk a subtree for media, descending into shadow roots.
+   *
+   * PERF: this is deliberately NOT `querySelectorAll("*")`. Walking every element
+   * looking for `.shadowRoot` costs ~6.6ms on a 30k-node page; run per mutation on
+   * a busy SPA that saturates the main thread and the tab gets killed. A TreeWalker
+   * over the subtree that actually changed is thousands of times cheaper.
+   */
+  function scanSubtree(root) {
+    if (!root) return;
+    if (root.nodeType === 1) {
+      if (root.tagName === "VIDEO" || root.tagName === "AUDIO") attach(root);
+      if (root.shadowRoot) scanSubtree(root.shadowRoot);
+    }
+    if (!root.querySelectorAll) return;
     root.querySelectorAll("video, audio").forEach(attach);
-    root.querySelectorAll("*").forEach((node) => {
-      if (node.shadowRoot) scan(node.shadowRoot);
-    });
-    scanPerformanceResources();
+
+    // Shadow hosts can't be found with a selector, so we do have to walk — but
+    // only within the changed subtree, and only when one might exist.
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT);
+    for (let n = walker.nextNode(); n; n = walker.nextNode()) {
+      if (n.shadowRoot) scanSubtree(n.shadowRoot);
+    }
+  }
+
+  /** Full-document sweep. Only for boot / explicit rescans — never per mutation. */
+  function scan(root = document) {
+    scanSubtree(root);
+    reapDetached();
     flushNetworkUrls();
+  }
+
+  // Coalesce mutation bursts into one pass per frame. Without this an SPA feed
+  // fires hundreds of batches a second and we'd do the work on every one.
+  let pendingRoots = [];
+  let scanScheduled = false;
+  function scheduleScan(roots) {
+    if (roots && roots.length) pendingRoots.push(...roots);
+    if (scanScheduled) return;
+    scanScheduled = true;
+    requestAnimationFrame(() => {
+      scanScheduled = false;
+      const roots = pendingRoots;
+      pendingRoots = [];
+      for (const r of roots) {
+        if (r && r.isConnected !== false) scanSubtree(r);
+      }
+      publish();
+    });
   }
 
   function startObserver() {
     if (observer) return;
     observer = new MutationObserver((mutations) => {
-      let needScan = false;
+      const roots = [];
       for (const m of mutations) {
-        if (m.addedNodes?.length) needScan = true;
+        if (m.addedNodes && m.addedNodes.length) {
+          for (const n of m.addedNodes) if (n.nodeType === 1) roots.push(n);
+        }
         if (
           m.type === "attributes" &&
           (m.target.tagName === "VIDEO" ||
             m.target.tagName === "AUDIO" ||
             m.target.tagName === "SOURCE")
         ) {
-          needScan = true;
+          roots.push(m.target);
         }
       }
-      if (needScan) {
-        scan();
-        publish();
-      }
+      if (roots.length) scheduleScan(roots);
     });
     observer.observe(document.documentElement || document.body, {
       childList: true,
@@ -432,6 +571,17 @@
       attributes: true,
       attributeFilter: ["src", "poster"],
     });
+  }
+
+  /**
+   * Drop elements that have left the DOM. `elements` holds hard references to
+   * media nodes plus their base64 thumbnails, so without this an SPA that swaps
+   * players on every navigation leaks them forever until the tab runs out of memory.
+   */
+  function reapDetached() {
+    for (const [id, entry] of elements) {
+      if (!entry.el || !entry.el.isConnected) elements.delete(id);
+    }
   }
 
   function getEntry(id) {
@@ -574,6 +724,13 @@
       return;
     }
 
+    // The popup can't open a custom scheme itself (and Safari blocks its
+    // localhost POST), so it delegates the handoff down to us.
+    if (msg.type === "VIDEOPRO_SEND_VIA_SCHEME") {
+      sendResponse({ ok: sendViaScheme(msg.payload || {}) });
+      return;
+    }
+
     if (msg.type === "VIDEOPRO_SCAN") {
       scan();
       publish(true);
@@ -678,6 +835,9 @@
     publish(true);
     if (pollTimer) clearInterval(pollTimer);
     pollTimer = setInterval(() => {
+      // Resource sweeping lives here, not in scan() — it must not run per mutation.
+      scanPerformanceResources();
+      reapDetached();
       // retry thumbs for videos still missing one
       for (const entry of elements.values()) {
         if (

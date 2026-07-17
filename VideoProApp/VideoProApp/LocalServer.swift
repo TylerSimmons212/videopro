@@ -18,6 +18,11 @@ final class LocalServer {
     /// Called on listener state changes with a human-readable status.
     var onStatus: (@Sendable (Bool, String) -> Void)?
 
+    /// Fired whenever a browser extension talks to us at all. The popup hits
+    /// /health every time it opens, so this is a reliable "the extension is
+    /// installed and can reach me" signal — which the setup UI reports back.
+    var onContact: (@Sendable () -> Void)?
+
     private var listener: NWListener?
     // Concurrent so a slow/half-open connection can never head-of-line block the
     // listener or other connections.
@@ -102,6 +107,7 @@ final class LocalServer {
             respond(conn, status: "204 No Content", json: nil)
 
         case ("GET", "/health"), ("GET", "/"):
+            onContact?()
             respond(conn, status: "200 OK", json: #"{"ok":true,"name":"VideoPro"}"#)
 
         case ("POST", "/videos"):
@@ -110,6 +116,7 @@ final class LocalServer {
                 return
             }
             let metas = VideoMapper.metas(from: batch)
+            onContact?()
             onBatch?(metas)
             respond(conn, status: "200 OK", json: #"{"ok":true,"count":\#(metas.count)}"#)
 

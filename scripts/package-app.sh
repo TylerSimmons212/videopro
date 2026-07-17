@@ -43,11 +43,28 @@ fetch_ff ffmpeg
 fetch_ff ffprobe
 xattr -cr "$BIN" 2>/dev/null || true
 
+# ── 1b. refresh bundled extension ────────────────────────────────────────────
+# extension.zip and the Safari target's Resources are BUILD INPUTS copied from
+# extension/. Regenerate them here so a release can never ship a stale copy of
+# the extension while the source tree looks up to date.
+echo "→ refreshing bundled extension from extension/…"
+bash "$ROOT/scripts/bundle-extension.sh" >/dev/null
+bash "$ROOT/scripts/sync-safari.sh"       >/dev/null
+echo "✓ extension.zip + Safari resources synced"
+
 # ── 2. build Release ─────────────────────────────────────────────────────────
-echo "→ building Release…"
+# Sparkle decides "is this newer?" from CFBundleVersion (sparkle:version), NOT
+# from the marketing version. The project hard-codes CURRENT_PROJECT_VERSION = 1,
+# so without this every release would look like version "1" to Sparkle and no
+# update would EVER be offered. Derive a monotonic build number instead.
+MV="$(grep -m1 'MARKETING_VERSION = ' "$PROJ/project.pbxproj" | sed 's/.*= *//; s/;//')"
+IFS=. read -r _MA _MI _PA <<< "$MV"
+BUILD_NUM=$(( ${_MA:-0} * 10000 + ${_MI:-0} * 100 + ${_PA:-0} ))
+echo "→ building Release ($MV, CFBundleVersion $BUILD_NUM)…"
 xcodebuild -project "$PROJ" -scheme VideoProApp -configuration Release \
   -destination 'platform=macOS' \
   CONFIGURATION_BUILD_DIR="$BUILD" \
+  CURRENT_PROJECT_VERSION="$BUILD_NUM" \
   build >/dev/null
 rm -rf "$APP"
 cp -R "$BUILD/VideoProApp.app" "$APP"

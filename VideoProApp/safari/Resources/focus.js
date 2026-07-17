@@ -221,7 +221,13 @@
       const data = await res.json();
       btn.textContent = data.ok ? "✓ Sent" : "Failed";
     } catch {
-      btn.textContent = "App offline";
+      // The POST can't get through — either the app is closed, or we're in Safari,
+      // which blocks extensions from reaching 127.0.0.1 at all. Hand the payload to
+      // the app through the videopro:// scheme instead; that also launches it.
+      const sent =
+        typeof window.__videoproSendViaScheme === "function" &&
+        window.__videoproSendViaScheme(payload);
+      btn.textContent = sent ? "Opening VideoPro…" : "App unavailable";
     }
     setTimeout(() => (btn.textContent = "⬇ Send to app"), 1800);
   }

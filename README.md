@@ -25,8 +25,9 @@ thing only a browser can do: see the video playing on the current page.
 - **Download queue** with a concurrency limit; **persistent history** (survives relaunch)
 - **Quality picker** per video (Best · MP4/H.264 · 2160–480p · Audio-only), probed live
 - Embeds **thumbnail + subtitles + metadata**; prefers H.264/AAC for universal playback
-- **Play** in-app (AVKit); auto-generated preview frames for videos without a thumbnail
-- **Convert / trim** finished downloads → MP4 clip · GIF · MP3 (ffmpeg)
+- **Play** in-app (AVKit) — pre-warmed on arrival, so it opens instantly
+- **Clip · GIF · MP3** from any video, downloaded or not: a clip fetches only the
+  section you asked for, MP3 fetches audio-only
 - **Paste a URL** to grab a video without the extension
 - Completion **notifications** + Dock badge; **Liquid Glass** UI (macOS 26+)
 - First-launch **onboarding** that installs the extension for you
@@ -38,6 +39,8 @@ thing only a browser can do: see the video playing on the current page.
 - Toolbar **badge** with the video count; **⌘⇧Y** hotkey to pop out the active video
 - **Auto-launches the app** (via `videopro://`) if it isn't running when you Send
 - Remembers what you've already sent
+- **Works in Safari**, which blocks extensions from reaching `127.0.0.1`: sends fall
+  back to handing the payload to the app through the `videopro://` URL scheme
 
 ## Repository layout
 
@@ -107,6 +110,9 @@ Until notarized, recipients right-click → **Open** once to bypass Gatekeeper's
   stream lives in a protected buffer. VideoPro flags these `🔒 DRM`; pop-out still works
   for viewing.
 - Trim uses stream-copy (instant, snaps to keyframes). Convert re-encodes.
+- Exporting a video you haven't downloaded has to fetch its source first — only
+  the requested section for a clip/GIF, audio-only for MP3. Exports from an
+  already-downloaded file skip the network entirely.
 
 ## License / ethics
 

@@ -176,6 +176,31 @@ final class VideoItem: ObservableObject, Identifiable {
     @Published var probing = false
     @Published var enriched = false
 
+    /// True once Play can start with no work — drives the "Ready" badge.
+    @Published var readyToPlay = false
+
+    // Pre-resolved stream. Deliberately NOT persisted: signed CDN URLs expire,
+    // so a stale one from a previous launch would 403 instead of playing.
+    private var playURL: URL?
+    private var playURLExpiry: Date?
+
+    /// A URL we can hand to AVPlayer *right now*: the finished download if we
+    /// have one, otherwise the pre-resolved stream while it's still fresh.
+    /// `nil` means the caller has to resolve the slow way.
+    var warmPlayURL: URL? {
+        if !outputPath.isEmpty, FileManager.default.fileExists(atPath: outputPath) {
+            return URL(fileURLWithPath: outputPath)
+        }
+        if let u = playURL, let exp = playURLExpiry, exp > Date() { return u }
+        return nil
+    }
+
+    func setPlayURL(_ url: URL?, expires: Date?) {
+        playURL = url
+        playURLExpiry = expires
+        readyToPlay = warmPlayURL != nil
+    }
+
     // ffmpeg export/convert in progress.
     @Published var busy = false
     @Published var busyLabel = ""
@@ -208,6 +233,7 @@ final class VideoItem: ObservableObject, Identifiable {
         progress = 1
         if !path.isEmpty { outputPath = path }
         statusLine = "Completed"
+        readyToPlay = warmPlayURL != nil   // the local file now beats any stream
     }
 
     func markError(_ message: String) {
