@@ -50,22 +50,56 @@ GENERATE_APPCAST="$(find_tool generate_appcast)"
 echo "→ using $GENERATE_APPCAST"
 
 # ── 1. Developer ID sign (Sparkle updates must pass Gatekeeper) ──────────────
+#
+# Skip entirely if we already have a notarized+stapled DMG for this version.
+# Re-signing rebuilds the DMG, which INVALIDATES the notarization ticket — so
+# re-running the script after notarizing used to throw the ticket away and demand
+# notarization again, forever.
+if [ -f "$DMG" ] && xcrun stapler validate "$DMG" >/dev/null 2>&1; then
+  echo "✓ dist/VideoPro.dmg is already notarized + stapled — skipping sign/rebuild"
+else
+
 echo "→ signing with Developer ID + hardened runtime…"
-# Nested code first, then the app. --deep is deprecated/unreliable for this.
+sign () { codesign --force --options runtime --timestamp -s "$DEVID" "$@"; }
+
+# Bundled tools.
 find "$APP/Contents/Resources/bin" -type f -perm +111 -exec \
   codesign --force --options runtime --timestamp -s "$DEVID" {} \;
-if [ -d "$APP/Contents/Frameworks" ]; then
-  for f in "$APP/Contents/Frameworks/"*; do
-    codesign --force --options runtime --timestamp -s "$DEVID" "$f"
-  done
+
+# Sparkle must be signed INSIDE-OUT. `codesign` on a framework does NOT recurse
+# into nested bundles, so signing only the framework left Autoupdate, Updater.app
+# and the XPC services ad-hoc — which Apple rejects, producing an Invalid
+# notarization and a "staple and validate failed! Error 65".
+SPARKLE="$APP/Contents/Frameworks/Sparkle.framework"
+if [ -d "$SPARKLE" ]; then
+  SPV="$SPARKLE/Versions/Current"
+  for x in "$SPV/XPCServices/"*.xpc; do [ -e "$x" ] && sign "$x"; done
+  [ -e "$SPV/Updater.app" ] && sign "$SPV/Updater.app"
+  [ -e "$SPV/Autoupdate" ] && sign "$SPV/Autoupdate"
+  sign "$SPARKLE"
 fi
-if [ -d "$APP/Contents/PlugIns" ]; then
-  for p in "$APP/Contents/PlugIns/"*; do
-    codesign --force --options runtime --timestamp -s "$DEVID" "$p"
-  done
-fi
-codesign --force --options runtime --timestamp -s "$DEVID" "$APP"
-codesign --verify --strict --verbose=1 "$APP" && echo "  ✓ signed"
+
+# Any other frameworks, then plug-ins, then the app itself (outermost last).
+for f in "$APP/Contents/Frameworks/"*; do
+  [ "$f" = "$SPARKLE" ] && continue
+  [ -e "$f" ] && sign "$f"
+done
+for p in "$APP/Contents/PlugIns/"*; do [ -e "$p" ] && sign "$p"; done
+sign "$APP"
+
+# Fail loudly here rather than 20 minutes later at Apple: every executable must
+# carry a Developer ID, not adhoc.
+echo "→ verifying no ad-hoc signatures remain…"
+ADHOC=0
+while IFS= read -r m; do
+  if codesign -dvv "$m" 2>&1 | grep -q "Signature=adhoc"; then
+    echo "  ✗ still ad-hoc: ${m#"$APP/"}"; ADHOC=1
+  fi
+done < <(find "$APP" \( -name "*.xpc" -o -name "*.app" -o -name "*.framework" -o -name "*.appex" \) -print; \
+         find "$APP/Contents/Resources/bin" -type f -perm +111 -print 2>/dev/null; \
+         find "$APP/Contents/Frameworks" -maxdepth 3 -type f -perm +111 -print 2>/dev/null)
+[ "$ADHOC" -eq 0 ] || { echo "✗ ad-hoc code would fail notarization — aborting"; exit 1; }
+codesign --verify --strict --deep "$APP" && echo "  ✓ signed, no ad-hoc code"
 
 # Rebuild the DMG from the now-properly-signed app.
 echo "→ rebuilding DMG from the signed app…"
@@ -76,6 +110,8 @@ rm -f "$DMG"
 hdiutil create -volname "VideoPro" -srcfolder "$STAGE" -ov -format UDZO "$DMG" >/dev/null
 rm -rf "$STAGE"
 codesign --force -s "$DEVID" "$DMG"
+
+fi  # end sign/build
 
 # ── 2. Notarize — YOU must run this ──────────────────────────────────────────
 if ! xcrun stapler validate "$DMG" >/dev/null 2>&1; then
@@ -91,9 +127,16 @@ if ! xcrun stapler validate "$DMG" >/dev/null 2>&1; then
 │      --keychain-profile VIDEOPRO --wait                                │
 │    xcrun stapler staple "$DMG"                                         │
 │                                                                        │
+│  If submit says "Invalid" (and stapler then fails with Error 65),      │
+│  ask Apple exactly why — don't guess:                                  │
+│    xcrun notarytool log <submission-id> --keychain-profile VIDEOPRO    │
+│                                                                        │
 │  (one-time, if you haven't stored the profile:)                        │
 │    xcrun notarytool store-credentials VIDEOPRO \\
 │      --apple-id "<you@example.com>" --team-id 7MGPA96634               │
+│                                                                        │
+│  Then re-run this script — it will detect the stapled DMG and skip     │
+│  straight to publishing (it will NOT re-sign and invalidate it).       │
 └────────────────────────────────────────────────────────────────────────┘
 EOF
   exit 2
@@ -116,7 +159,10 @@ echo "  ✓ wrote appcast.xml"
 grep -o 'sparkle:edSignature="[^"]\{0,18\}' "$ROOT/appcast.xml" | head -3 | sed 's/^/    /'
 
 # ── 4. Publish ───────────────────────────────────────────────────────────────
-echo "→ publishing GitHub release v$VERSION…"
+# NB: braces are load-bearing. `$VERSION…` let bash absorb the UTF-8 ellipsis
+# into the variable name, so it looked up `VERSION…`, found nothing, and `set -u`
+# aborted the release right after notarization had already succeeded.
+echo "→ publishing GitHub release v${VERSION}…"
 gh release create "v$VERSION" "$FEEDDIR/VideoPro-$VERSION.dmg" \
   --title "VideoPro $VERSION" \
   --notes "See the changelog. Existing users get this automatically via Sparkle." \
