@@ -2,105 +2,189 @@ import SwiftUI
 import AVKit
 import Combine
 
+// MARK: - Library sections
+
+/// Sidebar sections. Filtering by state is the main thing a download manager has
+/// to do well once you have more than a handful of videos.
+enum LibrarySection: String, CaseIterable, Identifiable, Hashable {
+    case all         = "All Videos"
+    case downloading = "Downloading"
+    case completed   = "Completed"
+    case failed      = "Failed"
+
+    var id: String { rawValue }
+
+    var systemImage: String {
+        switch self {
+        case .all:         return "square.stack"
+        case .downloading: return "arrow.down.circle"
+        case .completed:   return "checkmark.circle"
+        case .failed:      return "exclamationmark.triangle"
+        }
+    }
+
+    func matches(_ item: VideoItem) -> Bool {
+        switch self {
+        case .all:         return true
+        case .downloading: return item.status == .downloading || item.status == .queued
+        case .completed:   return item.status == .done
+        case .failed:      return item.status == .error
+        }
+    }
+}
+
+// MARK: - Root
+
 struct ContentView: View {
     @EnvironmentObject var state: AppState
-    @State private var playerItem: PlayerContext?
-    @State private var showSettings = false
-    @State private var showAddURL = false
-    @State private var urlText = ""
+    @State private var section: LibrarySection = .all
     @AppStorage("vp.hasOnboarded") private var hasOnboarded = false
     @State private var showOnboarding = false
-    @State private var convertItem: VideoItem?
 
     var body: some View {
-        ZStack {
-            BackdropView()
-
-            Group {
-                if state.items.isEmpty {
-                    EmptyStateView()
-                } else {
-                    listView
-                }
-            }
+        NavigationSplitView {
+            SidebarView(selection: $section)
+                .navigationSplitViewColumnWidth(min: 188, ideal: 208, max: 260)
+        } detail: {
+            LibraryView(section: section)
         }
-        .navigationTitle("VideoPro")
         .onAppear { if !hasOnboarded { showOnboarding = true } }
         .sheet(isPresented: $showOnboarding) {
             OnboardingView { hasOnboarded = true; showOnboarding = false }
                 .environmentObject(state)
         }
-        .toolbar {
-            ToolbarItem(placement: .navigation) { statusPill }
-            ToolbarItemGroup(placement: .primaryAction) {
-                Button { showAddURL.toggle() } label: {
-                    Image(systemName: "plus")
-                }
-                .help("Add a video by URL")
-                .popover(isPresented: $showAddURL, arrowEdge: .bottom) {
-                    addURLPopover
-                }
-                if state.activeDownloads + state.queuedCount > 0 {
-                    HStack(spacing: 5) {
-                        ProgressView().controlSize(.small)
-                        Text(state.queuedCount > 0
-                             ? "\(state.activeDownloads)↓ · \(state.queuedCount) queued"
-                             : "\(state.activeDownloads) downloading")
-                            .font(.caption).foregroundStyle(.secondary)
-                    }
-                }
-                if !state.items.isEmpty {
-                    Button { state.downloadAll() } label: {
-                        Image(systemName: "arrow.down.circle")
-                    }
-                    .help("Download all")
-                }
-                Button { showSettings.toggle() } label: {
-                    Image(systemName: "slider.horizontal.3")
-                }
-                .help("Download settings")
-                .popover(isPresented: $showSettings, arrowEdge: .bottom) {
-                    SettingsPopover().environmentObject(state)
-                }
+    }
+}
 
-                if !state.items.isEmpty {
-                    Button(role: .destructive) { state.clear() } label: {
-                        Image(systemName: "trash")
-                    }
-                    .help("Clear all")
+// MARK: - Sidebar
+
+struct SidebarView: View {
+    @EnvironmentObject var state: AppState
+    @Binding var selection: LibrarySection
+
+    var body: some View {
+        List(selection: $selection) {
+            Section("Library") {
+                ForEach(LibrarySection.allCases) { s in
+                    Label(s.rawValue, systemImage: s.systemImage)
+                        .badge(count(s))
+                        .tag(s)
                 }
             }
         }
+        .listStyle(.sidebar)
+        // Status belongs down here, out of the toolbar — it's ambient, not an action.
+        .safeAreaInset(edge: .bottom) { statusFooter }
+    }
+
+    private func count(_ s: LibrarySection) -> Int {
+        state.items.filter(s.matches).count
+    }
+
+    private var statusFooter: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Divider()
+            statusLine(ok: state.serverRunning,
+                       text: state.serverRunning ? "Listening" : "Inactive")
+            statusLine(ok: state.extensionStatus.connected,
+                       text: state.extensionStatus.connected ? "Extension connected" : "No extension")
+        }
+        .padding(.horizontal, 12)
+        .padding(.bottom, 10)
+    }
+
+    private func statusLine(ok: Bool, text: String) -> some View {
+        HStack(spacing: 6) {
+            Circle()
+                .fill(ok ? Color.green : Color.secondary.opacity(0.45))
+                .frame(width: 6, height: 6)
+            Text(text)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+        }
+    }
+}
+
+// MARK: - Library (detail)
+
+struct LibraryView: View {
+    @EnvironmentObject var state: AppState
+    let section: LibrarySection
+
+    @State private var playerItem: PlayerContext?
+    @State private var convertItem: VideoItem?
+    @State private var showSettings = false
+    @State private var showAddURL = false
+    @State private var urlText = ""
+
+    private var items: [VideoItem] { state.items.filter(section.matches) }
+
+    var body: some View {
+        Group {
+            if state.items.isEmpty {
+                ZStack { BackdropView(); EmptyStateView() }
+            } else if items.isEmpty {
+                ContentUnavailableView(
+                    "Nothing \(section.rawValue.lowercased())",
+                    systemImage: section.systemImage,
+                    description: Text("Videos will show up here as they change state.")
+                )
+            } else {
+                List {
+                    ForEach(items) { item in
+                        VideoRow(item: item,
+                                 onPlay: { play(item) },
+                                 onExport: { convertItem = item })
+                            .environmentObject(state)
+                            .listRowInsets(EdgeInsets(top: 6, leading: 10, bottom: 6, trailing: 10))
+                    }
+                }
+                .listStyle(.inset)
+                .alternatingRowBackgrounds()
+            }
+        }
+        .navigationTitle(section.rawValue)
+        .navigationSubtitle(subtitle)
+        .toolbar { toolbarContent }
         .sheet(item: $playerItem) { PlayerSheet(context: $0) }
         .sheet(item: $convertItem) { ConvertSheet(item: $0).environmentObject(state) }
     }
 
-    private var listView: some View {
-        ScrollView {
-            GlassEffectContainer(spacing: 14) {
-                LazyVStack(spacing: 14) {
-                    ForEach(state.items) { item in
-                        VideoCard(item: item, onPlay: { play(item) }, onExport: { convertItem = item })
-                            .environmentObject(state)
-                    }
-                }
-                .padding(18)
-            }
+    private var subtitle: String {
+        let n = items.count
+        let base = "\(n) video\(n == 1 ? "" : "s")"
+        if state.activeDownloads + state.queuedCount > 0 {
+            return base + " · \(state.activeDownloads) downloading"
+                + (state.queuedCount > 0 ? ", \(state.queuedCount) queued" : "")
         }
+        return base
     }
 
-    private var statusPill: some View {
-        // No .glassEffect here — the toolbar already provides the glass background;
-        // adding our own capsule produced a "pill inside a pill".
-        HStack(spacing: 6) {
-            Circle()
-                .fill(state.serverRunning ? Color.green : Color.orange)
-                .frame(width: 7, height: 7)
-                .shadow(color: state.serverRunning ? .green : .orange, radius: 4)
-            Text(state.serverRunning ? "Active" : "Inactive")
-                .font(.caption).foregroundStyle(.secondary)
+    @ToolbarContentBuilder
+    private var toolbarContent: some ToolbarContent {
+        ToolbarItemGroup(placement: .primaryAction) {
+            if state.activeDownloads + state.queuedCount > 0 {
+                ProgressView().controlSize(.small)
+            }
+            Button { showAddURL.toggle() } label: { Image(systemName: "plus") }
+                .help("Add a video by URL")
+                .popover(isPresented: $showAddURL, arrowEdge: .bottom) { addURLPopover }
+
+            if state.items.contains(where: { $0.status == .idle || $0.status == .error }) {
+                Button { state.downloadAll() } label: { Image(systemName: "arrow.down.circle") }
+                    .help("Download all")
+            }
+            Button { showSettings.toggle() } label: { Image(systemName: "slider.horizontal.3") }
+                .help("Settings")
+                .popover(isPresented: $showSettings, arrowEdge: .bottom) {
+                    SettingsPopover().environmentObject(state)
+                }
+            if !state.items.isEmpty {
+                Button(role: .destructive) { state.clear() } label: { Image(systemName: "trash") }
+                    .help("Clear all")
+            }
         }
-        .padding(.horizontal, 8)
     }
 
     private var addURLPopover: some View {
@@ -172,44 +256,93 @@ struct BackdropView: View {
     }
 }
 
-// MARK: - Video card
+// MARK: - Video row
 
-struct VideoCard: View {
+/// One video in the library list.
+///
+/// Replaces the old full-width glass card: at ~72pt a row shows roughly 5x more
+/// videos per screen, which is what actually matters once you've sent a dozen.
+/// Actions stay hidden until hover so the list reads as content, not chrome —
+/// except while downloading, where Cancel must always be reachable.
+struct VideoRow: View {
     @EnvironmentObject var state: AppState
     @ObservedObject var item: VideoItem
     let onPlay: () -> Void
     var onExport: () -> Void = {}
     @State private var showQuality = false
+    @State private var hovering = false
 
     var body: some View {
-        HStack(alignment: .top, spacing: 14) {
-            ThumbView(thumb: item.thumbnail)
-                .frame(width: 148, height: 83)
+        HStack(spacing: 12) {
+            ZStack {
+                ThumbView(thumb: item.thumbnail)
+                    .frame(width: 96, height: 54)
+                    .clipShape(.rect(cornerRadius: 6))
+                // Play affordance right where the eye already is.
+                if hovering {
+                    Button(action: onPlay) {
+                        Image(systemName: "play.fill")
+                            .font(.system(size: 13))
+                            .foregroundStyle(.white)
+                            .frame(width: 96, height: 54)
+                            .background(.black.opacity(0.45))
+                    }
+                    .buttonStyle(.plain)
+                    .clipShape(.rect(cornerRadius: 6))
+                    .help("Play")
+                }
+            }
 
-            VStack(alignment: .leading, spacing: 6) {
+            VStack(alignment: .leading, spacing: 3) {
                 Text(item.meta.title)
-                    .font(.headline).fontWeight(.semibold)
-                    .lineLimit(2)
+                    .font(.system(size: 13, weight: .medium))
+                    .lineLimit(1)
+                    .truncationMode(.middle)
 
-                HStack(spacing: 6) {
+                HStack(spacing: 5) {
                     if let p = item.meta.platform, !p.isEmpty { Pill(text: p, tint: .purple) }
-                    Pill(text: item.meta.sourceKind.uppercased())
                     if let d = item.meta.prettyDuration { Pill(text: d) }
                     if item.meta.height > 0 { Pill(text: "\(item.meta.height)p") }
+                    if let host = URL(string: item.meta.downloadURL)?.host {
+                        Text(host).font(.caption2).foregroundStyle(.tertiary).lineLimit(1)
+                    }
                 }
 
-                if let host = URL(string: item.meta.downloadURL)?.host {
-                    Text(host).font(.caption).foregroundStyle(.secondary).lineLimit(1)
-                }
-
-                statusView.padding(.top, 2)
+                statusView
             }
 
             Spacer(minLength: 4)
-            controls
+            controls.opacity(hovering || alwaysShowControls ? 1 : 0)
         }
-        .padding(14)
-        .glassEffect(.regular.interactive(), in: .rect(cornerRadius: 20))
+        .padding(.vertical, 5)
+        .contentShape(.rect)
+        .onHover { hovering = $0 }
+        .onTapGesture(count: 2, perform: onPlay)
+        .contextMenu { contextMenu }
+    }
+
+    /// While a download is live the Cancel button can't be hover-gated.
+    private var alwaysShowControls: Bool {
+        item.status == .downloading || item.status == .queued
+    }
+
+    @ViewBuilder private var contextMenu: some View {
+        Button("Play", action: onPlay)
+        if item.status == .idle || item.status == .error {
+            Button("Download") { state.download(item) }
+        }
+        Button("Clip · GIF · MP3…", action: onExport)
+            .disabled(item.busy || !state.canExport(item))
+        if state.canExport(item), !item.outputPath.isEmpty {
+            Button("Show in Finder") { state.revealInFinder(item) }
+        }
+        Divider()
+        Button("Copy Source URL") {
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(item.meta.downloadURL, forType: .string)
+        }
+        Divider()
+        Button("Remove", role: .destructive) { state.remove(item) }
     }
 
     @ViewBuilder private var statusView: some View {
@@ -226,64 +359,61 @@ struct VideoCard: View {
     @ViewBuilder private var downloadStatus: some View {
         switch item.status {
         case .queued:
-            Label("Queued…", systemImage: "clock")
-                .font(.caption).foregroundStyle(.secondary)
+            Label("Queued", systemImage: "clock")
+                .font(.caption2).foregroundStyle(.secondary)
         case .downloading:
-            VStack(alignment: .leading, spacing: 3) {
-                ProgressView(value: item.progress).progressViewStyle(.linear).tint(.purple)
-                Text("\(Int(item.progress * 100))%  ·  \(item.statusLine)")
-                    .font(.caption2).foregroundStyle(.secondary).lineLimit(1)
+            HStack(spacing: 7) {
+                ProgressView(value: item.progress)
+                    .progressViewStyle(.linear).tint(.purple)
+                    .frame(width: 130)
+                Text("\(Int(item.progress * 100))%")
+                    .font(.caption2).monospacedDigit().foregroundStyle(.secondary)
+                Text(item.statusLine)
+                    .font(.caption2).foregroundStyle(.tertiary).lineLimit(1)
             }
-            .frame(maxWidth: 280)
         case .done:
-            Label("Saved to \(state.downloadFolder.lastPathComponent)", systemImage: "checkmark.circle.fill")
-                .font(.caption).foregroundStyle(.green)
+            Label("Saved", systemImage: "checkmark.circle.fill")
+                .font(.caption2).foregroundStyle(.green)
         case .error:
             Label(item.statusLine, systemImage: "exclamationmark.triangle.fill")
-                .font(.caption).foregroundStyle(.orange).lineLimit(2)
+                .font(.caption2).foregroundStyle(.orange).lineLimit(1)
         default:
             if !item.statusLine.isEmpty {
-                Text(item.statusLine).font(.caption2).foregroundStyle(.secondary)
+                Text(item.statusLine).font(.caption2).foregroundStyle(.secondary).lineLimit(1)
             } else if item.readyToPlay {
-                Label("Ready to play", systemImage: "bolt.fill")
-                    .font(.caption2).foregroundStyle(.secondary)
+                Label("Ready", systemImage: "bolt.fill")
+                    .font(.caption2).foregroundStyle(.tertiary)
             } else if item.probing {
                 Label("Getting ready…", systemImage: "arrow.triangle.2.circlepath")
-                    .font(.caption2).foregroundStyle(.secondary)
+                    .font(.caption2).foregroundStyle(.tertiary)
             }
         }
     }
 
     @ViewBuilder private var controls: some View {
-        VStack(spacing: 8) {
-            Button(action: onPlay) {
-                Image(systemName: "play.fill").frame(width: 34, height: 30)
-            }
-            .buttonStyle(.glass)
-            .help("Play")
-
+        HStack(spacing: 4) {
             switch item.status {
             case .downloading, .queued:
-                Button { state.cancel(item) } label: {
-                    Image(systemName: "stop.fill").frame(width: 34, height: 30)
+                iconButton("stop.fill", help: item.status == .queued ? "Remove from queue" : "Cancel") {
+                    state.cancel(item)
                 }
-                .buttonStyle(.glass)
-                .help(item.status == .queued ? "Remove from queue" : "Cancel")
             case .done:
-                Button { state.revealInFinder(item) } label: {
-                    Image(systemName: "folder.fill").frame(width: 34, height: 30)
-                }
-                .buttonStyle(.glass)
-                .help("Show in Finder")
+                iconButton("folder", help: "Show in Finder") { state.revealInFinder(item) }
+                iconButton("wand.and.stars", help: "Clip · GIF · MP3…", action: onExport)
+                    .disabled(item.busy)
             default:
+                // Clip/GIF/MP3 works without downloading first — the export
+                // fetches only the part it needs.
+                iconButton("wand.and.stars", help: "Clip · GIF · MP3…", action: onExport)
+                    .disabled(item.busy || !state.canExport(item))
                 Button {
                     showQuality.toggle()
                     if showQuality { state.probeQualities(item) }
                 } label: {
-                    Image(systemName: "arrow.down.to.line").frame(width: 34, height: 30)
+                    Image(systemName: "arrow.down.to.line").font(.system(size: 11))
+                        .frame(width: 26, height: 22)
                 }
-                .buttonStyle(.glassProminent)
-                .tint(.purple)
+                .buttonStyle(.borderedProminent).tint(.purple)
                 .help("Download…")
                 .popover(isPresented: $showQuality, arrowEdge: .trailing) {
                     QualityPopover(item: item) { quality in
@@ -293,24 +423,17 @@ struct VideoCard: View {
                     .environmentObject(state)
                 }
             }
-
-            // Clip / GIF / MP3 are available from the start — no need to download
-            // the full video first; the export fetches its own source if needed.
-            if item.status != .downloading, item.status != .queued {
-                Button(action: onExport) {
-                    Image(systemName: "wand.and.stars").frame(width: 34, height: 30)
-                }
-                .buttonStyle(.glass)
-                .help("Clip · GIF · MP3…")
-                .disabled(item.busy || !state.canExport(item))
-            }
-
-            Button { state.remove(item) } label: {
-                Image(systemName: "xmark").frame(width: 34, height: 24)
-            }
-            .buttonStyle(.glass)
-            .help("Remove")
+            iconButton("xmark", help: "Remove") { state.remove(item) }
         }
+    }
+
+    private func iconButton(_ symbol: String, help: String,
+                            action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: symbol).font(.system(size: 11)).frame(width: 26, height: 22)
+        }
+        .buttonStyle(.bordered)
+        .help(help)
     }
 }
 
