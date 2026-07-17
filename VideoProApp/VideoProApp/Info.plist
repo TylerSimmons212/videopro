@@ -2,6 +2,20 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+	<!-- Sparkle: where to look for updates. Served straight off the public repo;
+	     no hosting to maintain. -->
+	<key>SUFeedURL</key>
+	<string>https://raw.githubusercontent.com/TylerSimmons212/videopro/main/appcast.xml</string>
+	<!-- Public half of the EdDSA key in the developer's Keychain. Safe to commit —
+	     it's what lets clients VERIFY updates. Updates whose sparkle:edSignature
+	     doesn't match this key are rejected. -->
+	<key>SUPublicEDKey</key>
+	<string>qEWeFK8yNh0gb7jhHr+b/dGZsFgfeanZpzEYLmkOkDM=</string>
+	<!-- Ask on second launch rather than silently phoning home on first run. -->
+	<key>SUEnableAutomaticChecks</key>
+	<true/>
+	<key>SUScheduledCheckInterval</key>
+	<integer>86400</integer>
 	<key>CFBundleURLTypes</key>
 	<array>
 		<dict>

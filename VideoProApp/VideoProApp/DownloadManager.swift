@@ -151,6 +151,92 @@ final class DownloadManager {
         item.markError("Cancelled")
     }
 
+    // MARK: - Fetch a source to export from
+
+    /// Grab media to convert/trim **without** adding it to the user's library.
+    ///
+    /// When `range` is set we ask yt-dlp for just that section, so trimming ten
+    /// seconds out of an hour-long video doesn't pull down the whole hour. The
+    /// returned file is then already the clip — callers must not re-cut it.
+    @MainActor
+    func fetchSource(_ item: VideoItem, format: String, range: (start: Double, end: Double)?,
+                     into folder: URL, completion: @escaping @MainActor (String?) -> Void) {
+        // Note: no markError here — an export that can't start must not leave the
+        // item looking like a *download* failed. The caller surfaces the problem.
+        guard let ytdlp = ytDlpPath else {
+            completion(nil)
+            return
+        }
+        try? FileManager.default.removeItem(at: folder)
+        try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+
+        var args = [
+            item.meta.downloadURL,
+            "--newline", "--no-playlist", "--no-part", "--restrict-filenames",
+            "-f", format,
+            "-o", folder.appendingPathComponent("source.%(ext)s").path,
+        ]
+        if let ff = ffmpegDirectory { args += ["--ffmpeg-location", ff] }
+        if let range {
+            // Section downloads are cut by ffmpeg, so they need it on PATH.
+            args += ["--download-sections", "*\(range.start)-\(range.end)"]
+        }
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: ytdlp)
+        process.arguments = args
+        process.currentDirectoryURL = folder
+
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = pipe
+        let id = item.id
+
+        var drmBlocked = false
+        pipe.fileHandleForReading.readabilityHandler = { handle in
+            let chunk = handle.availableData
+            guard !chunk.isEmpty, let text = String(data: chunk, encoding: .utf8) else { return }
+            for raw in text.split(whereSeparator: { $0 == "\n" || $0 == "\r" }) {
+                let line = String(raw)
+                // Report into busyLabel — this is an export, not a library download,
+                // so it must not touch the item's download status.
+                if let p = Self.parseProgress(line) {
+                    Task { @MainActor in item.busyLabel = "Fetching source… \(Int(p * 100))%" }
+                }
+                if line.contains("[DRM]") || line.contains("DRM protection") { drmBlocked = true }
+            }
+        }
+
+        process.terminationHandler = { [weak self] proc in
+            pipe.fileHandleForReading.readabilityHandler = nil
+            self?.forget(id)
+            let ok = proc.terminationStatus == 0 && !drmBlocked
+            // Pick the file straight out of our private temp dir rather than
+            // parsing stdout — the "Destination:" line varies by extractor and
+            // isn't printed at all in some section-download paths.
+            let file = ok ? Self.largestFile(in: folder) : nil
+            Task { @MainActor in completion(file?.path) }
+        }
+
+        do {
+            try process.run()
+            remember(id, process)
+        } catch {
+            completion(nil)
+        }
+    }
+
+    private static func largestFile(in folder: URL) -> URL? {
+        let files = (try? FileManager.default.contentsOfDirectory(
+            at: folder, includingPropertiesForKeys: [.fileSizeKey])) ?? []
+        func size(_ u: URL) -> Int {
+            (try? u.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+        }
+        return files
+            .filter { !$0.lastPathComponent.hasPrefix(".") }
+            .max(by: { size($0) < size($1) })
+    }
+
     // MARK: - Resolve a playable URL (for platform pages)
 
     /// Returns a direct, AVPlayer-friendly URL by asking yt-dlp for it.
@@ -303,6 +389,18 @@ final class DownloadManager {
         var title: String?
         var duration: Double?
         var heights: [Int]
+        var playURL: String?     // a muxed stream AVPlayer can open directly
+    }
+
+    /// Signed CDN URLs (googlevideo & friends) are time-limited. Trust the URL's
+    /// own `expire` hint when it has one; otherwise assume a conservative hour.
+    static func expiry(for urlString: String) -> Date {
+        if let comps = URLComponents(string: urlString),
+           let item = comps.queryItems?.first(where: { $0.name == "expire" || $0.name == "expires" }),
+           let secs = item.value.flatMap(Double.init), secs > 1_000_000_000 {
+            return Date(timeIntervalSince1970: secs).addingTimeInterval(-60)  // safety margin
+        }
+        return Date().addingTimeInterval(3600)
     }
 
     /// Ask yt-dlp (`-J`) for a video's real thumbnail, title, duration, and the
@@ -341,8 +439,36 @@ final class DownloadManager {
             thumbnail: json["thumbnail"] as? String,
             title: json["title"] as? String,
             duration: json["duration"] as? Double,
-            heights: set.sorted(by: >)
+            heights: set.sorted(by: >),
+            playURL: pickProgressiveURL(formats: formats, json: json)
         )
+    }
+
+    /// Pick a single **muxed** (video+audio) stream out of the info JSON so Play
+    /// can start instantly — without shelling out to `yt-dlp -g` a second time.
+    /// Adaptive-only formats are skipped: AVPlayer can't mux two streams itself.
+    private static func pickProgressiveURL(formats: [[String: Any]], json: [String: Any]) -> String? {
+        func rank(_ f: [String: Any]) -> (Int, Int) {
+            let ext = (f["ext"] as? String)?.lowercased() ?? ""
+            // Prefer mp4/mov (H.264) — universally playable in AVKit — then resolution.
+            let compat = (ext == "mp4" || ext == "m4v" || ext == "mov") ? 1 : 0
+            return (compat, (f["height"] as? Int) ?? 0)
+        }
+        let playable = formats.filter { f in
+            guard let u = f["url"] as? String, u.hasPrefix("http") else { return false }
+            let v = (f["vcodec"] as? String) ?? "none"
+            let a = (f["acodec"] as? String) ?? "none"
+            guard v != "none", a != "none" else { return false }   // must carry both
+            let ext = (f["ext"] as? String)?.lowercased() ?? ""
+            let isHLS = ((f["protocol"] as? String) ?? "").hasPrefix("m3u8")
+            return isHLS || ["mp4", "m4v", "mov", "webm"].contains(ext)
+        }
+        if let best = playable.max(by: { rank($0) < rank($1) }), let u = best["url"] as? String {
+            return u
+        }
+        // Direct files and HLS manifests report one top-level url and no formats.
+        if let u = json["url"] as? String, u.hasPrefix("http") { return u }
+        return nil
     }
 
     // MARK: - Parsing helpers

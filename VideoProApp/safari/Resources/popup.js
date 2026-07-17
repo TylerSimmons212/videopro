@@ -6,6 +6,16 @@
 
 const APP_BASE = "http://127.0.0.1:8787";
 
+// Safari blocks extensions from reaching 127.0.0.1, so /health can never answer
+// there no matter what the app is doing.
+//
+// MUST be declared before init() runs at the bottom of this block: `const` sits
+// in the temporal dead zone until its declaration is evaluated, so declaring it
+// further down made checkApp() throw ReferenceError on its first line. It's
+// fire-and-forget, so the rejection was swallowed — the status pill sat on
+// "Checking app…" forever and every send button stayed disabled.
+const IS_SAFARI = /^((?!chrome|chromium|android).)*safari/i.test(navigator.userAgent);
+
 const els = {
   list: document.getElementById("list"),
   empty: document.getElementById("empty"),
@@ -22,7 +32,13 @@ let sentStore = {}; // sentKey -> timestamp
 init();
 
 async function init() {
-  checkApp();
+  // Don't let this fail silently again — an unhandled rejection here left the
+  // status pill stuck on its initial "Checking app…" with no clue why.
+  checkApp().catch((err) => {
+    console.error("VideoPro: checkApp failed", err);
+    els.status.className = "status status--off";
+    els.statusText.textContent = "Status unavailable";
+  });
   await loadSent();
   els.sendBtn.addEventListener("click", sendAll);
 
@@ -73,6 +89,20 @@ function rememberSent(videos) {
 // ── App reachability ─────────────────────────────────────────────────────────
 
 async function checkApp() {
+  if (IS_SAFARI) {
+    // Probing would just time out and leave a permanent false "offline" warning.
+    // Sending works regardless (via videopro://), so report ready.
+    appOnline = false;
+    els.status.className = "status status--ok";
+    els.statusText.textContent = "Ready";
+    els.status.title = "Sending opens the VideoPro app";
+    els.status.style.cursor = "default";
+    els.status.onclick = null;
+    document.querySelectorAll(".act--send").forEach((b) => (b.disabled = false));
+    updateSendAll();
+    return;
+  }
+
   try {
     const res = await fetch(`${APP_BASE}/health`, { method: "GET" });
     const data = await res.json();
@@ -88,8 +118,9 @@ async function checkApp() {
     try { chrome.runtime.sendMessage({ type: "VP_LAUNCH" }); } catch {}
     toast("Opening VideoPro…", "ok");
   };
-  // Re-enable/disable card send buttons and the footer button.
-  document.querySelectorAll(".act--send").forEach((b) => (b.disabled = !appOnline));
+  // Never disable sending just because the app is closed — the fallback launches
+  // it and delivers the payload in one step.
+  document.querySelectorAll(".act--send").forEach((b) => (b.disabled = false));
   updateSendAll();
 }
 
@@ -101,11 +132,14 @@ function activeTab() {
   });
 }
 
-function askContent(tabId) {
+/** Ask one frame (frameId 0 = top), or every frame when frameId is undefined. */
+function askFrame(tabId, frameId) {
+  const opts = frameId === undefined ? {} : { frameId };
   return new Promise((resolve) => {
     try {
-      chrome.tabs.sendMessage(tabId, { type: "VIDEOPRO_SCAN" }, () => {
-        chrome.tabs.sendMessage(tabId, { type: "VIDEOPRO_GET" }, (resp) => {
+      chrome.tabs.sendMessage(tabId, { type: "VIDEOPRO_SCAN" }, opts, () => {
+        void chrome.runtime.lastError;
+        chrome.tabs.sendMessage(tabId, { type: "VIDEOPRO_GET" }, opts, (resp) => {
           if (chrome.runtime.lastError || !resp?.ok) return resolve(null);
           resolve(resp.payload);
         });
@@ -114,6 +148,23 @@ function askContent(tabId) {
       resolve(null);
     }
   });
+}
+
+/**
+ * Get the page's media payload.
+ *
+ * We run in all_frames, and a broadcast sendMessage resolves with whichever
+ * frame answers FIRST — a race. On YouTube that was often the hidden
+ * accounts.youtube.com/RotateCookiesPage iframe, whose host still ends in
+ * ".youtube.com", so we'd build a "YouTube" card pointing at cookie plumbing
+ * that yt-dlp can't resolve. Ask the top frame first, and only fall back to a
+ * broadcast when the top frame has nothing (i.e. the video lives in an iframe).
+ */
+async function askContent(tabId) {
+  const top = await askFrame(tabId, 0);
+  if (top && ((top.videos || []).length || (top.networkUrls || []).length)) return top;
+  const anyFrame = await askFrame(tabId, undefined);
+  return anyFrame || top;
 }
 
 function askNetwork(tabId) {
@@ -133,8 +184,12 @@ function askNetwork(tabId) {
 function normalize(payload, network, tab) {
   const out = [];
   const seen = new Set();
-  const pageUrl = payload?.pageUrl || tab.url || "";
-  const pageTitle = payload?.pageTitle || tab.title || "";
+  // The TAB's url is the page — always. A payload can come from a sub-frame
+  // (ads, cookie iframes, embeds), and letting that define the page URL is how
+  // we ended up sending accounts.youtube.com/RotateCookiesPage to the app.
+  // Per-video pageUrls still carry their own frame's URL, so real embeds survive.
+  const pageUrl = tab.url || payload?.pageUrl || "";
+  const pageTitle = tab.title || payload?.pageTitle || "";
 
   // Known platform page (YouTube, etc.) → ONE clean item.
   if (isPlatformPage(pageUrl)) {
@@ -299,7 +354,10 @@ function render(tab) {
     send.title = v.encrypted
       ? "Send to VideoPro (DRM may prevent download)"
       : "Send to the VideoPro app";
-    send.disabled = !appOnline;
+    // Never gate on app reachability: if the app is closed (or we're in Safari,
+    // where /health can't answer at all) the send still works — it hands off via
+    // videopro://, which launches the app and delivers in one step.
+    send.disabled = false;
     send.textContent = "⬇";
     send.addEventListener("click", (e) => { e.stopPropagation(); sendOne(item, send); });
     actions.append(send);
@@ -374,7 +432,8 @@ function sendableVideos() {
 
 function updateSendAll() {
   const n = sendableVideos().length;
-  els.sendBtn.disabled = !appOnline || n === 0;
+  // Gate on "is there anything to send", not on app reachability — see checkApp.
+  els.sendBtn.disabled = n === 0;
   els.sendBtn.textContent = n > 1 ? `Send all (${n})` : "Send all";
 }
 
@@ -384,20 +443,52 @@ async function postVideos(videos) {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ pageUrl: tab?.url || "", pageTitle: tab?.title || "", videos }),
+    // Don't sit on a dead connection when the app is closed — fail fast and let
+    // the caller fall back to launching it via videopro://.
+    signal: AbortSignal.timeout(2500),
   });
   return { data: await res.json(), tab };
 }
 
-// App offline → hand off to the background to launch the app and deliver once
-// it's up (survives this popup closing).
+// The POST didn't land. Two possible reasons, one fallback that covers both:
+//   • Chrome, app closed  → videopro:// launches it AND delivers the payload
+//   • Safari, any state   → Safari blocks extension→127.0.0.1 entirely, so the
+//                           URL scheme is the only channel we have
+// The content script owns this because a custom scheme has to be opened from a
+// real page context, not from the popup.
 async function delegateLaunchSend(videos) {
   const tab = await activeTab();
-  try {
-    chrome.runtime.sendMessage({
-      type: "VP_LAUNCH_AND_SEND",
-      payload: { pageUrl: tab?.url || "", pageTitle: tab?.title || "", videos },
-    });
-  } catch {}
+  const payload = {
+    pageUrl: tab?.url || "",
+    pageTitle: tab?.title || "",
+    videos,
+  };
+
+  let handed = false;
+  if (tab?.id != null) {
+    try {
+      // frameId 0 ONLY. A broadcast would have every frame on the page open its
+      // own videopro:// URL — N app launches and N "Open in VideoPro?" prompts.
+      const res = await chrome.tabs.sendMessage(
+        tab.id,
+        { type: "VIDEOPRO_SEND_VIA_SCHEME", payload },
+        { frameId: 0 }
+      );
+      handed = !!res?.ok;
+    } catch {
+      /* no content script on this page (chrome://, PDF viewer, …) */
+    }
+  }
+
+  // Chrome-only last resort: let the background launch the app and retry the
+  // POST after it's up. Pointless in Safari, but harmless — and it survives the
+  // popup closing, which the scheme path doesn't need to.
+  if (!handed) {
+    try {
+      chrome.runtime.sendMessage({ type: "VP_LAUNCH_AND_SEND", payload });
+    } catch {}
+  }
+
   rememberSent(videos);
   toast("Opening VideoPro…", "ok");
   setTimeout(() => window.close(), 1300);
@@ -405,6 +496,8 @@ async function delegateLaunchSend(videos) {
 
 async function sendOne(item, btn) {
   if (btn) btn.disabled = true;
+  // Safari can't POST to localhost at all — don't waste a timeout finding out.
+  if (IS_SAFARI) return delegateLaunchSend([item.video]);
   try {
     const { data, tab } = await postVideos([item.video]);
     if (data.ok) {
@@ -423,6 +516,7 @@ async function sendAll() {
   const videos = sendableVideos();
   if (!videos.length) return;
   els.sendBtn.disabled = true;
+  if (IS_SAFARI) return delegateLaunchSend(videos);
   try {
     const { data, tab } = await postVideos(videos);
     if (data.ok) {
