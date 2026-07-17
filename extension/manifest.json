@@ -1,9 +1,15 @@
 {
   "manifest_version": 3,
-  "name": "VideoPro — Send to App",
-  "version": "0.4.0",
+  "name": "VideoPro \u2014 Send to App",
+  "version": "1.0.8",
   "description": "Find videos on any page and send them to the VideoPro Mac app to play or download with yt-dlp.",
-  "permissions": ["activeTab", "scripting", "storage", "tabs", "webRequest"],
+  "permissions": [
+    "activeTab",
+    "scripting",
+    "storage",
+    "tabs",
+    "webRequest"
+  ],
   "host_permissions": [
     "<all_urls>",
     "http://127.0.0.1:8787/*",
@@ -14,7 +20,10 @@
   },
   "commands": {
     "pop-out": {
-      "suggested_key": { "default": "Ctrl+Shift+Y", "mac": "Command+Shift+Y" },
+      "suggested_key": {
+        "default": "Ctrl+Shift+Y",
+        "mac": "Command+Shift+Y"
+      },
       "description": "Pop out the active video into focus mode"
     }
   },
@@ -22,7 +31,7 @@
     "extension_pages": "script-src 'self'; object-src 'self'; img-src 'self' data: https:;"
   },
   "action": {
-    "default_title": "VideoPro — send videos to the app",
+    "default_title": "VideoPro \u2014 send videos to the app",
     "default_popup": "popup.html",
     "default_icon": {
       "16": "icons/icon16.png",
@@ -33,8 +42,13 @@
   },
   "content_scripts": [
     {
-      "matches": ["<all_urls>"],
-      "js": ["content.js", "focus.js"],
+      "matches": [
+        "<all_urls>"
+      ],
+      "js": [
+        "content.js",
+        "focus.js"
+      ],
       "run_at": "document_idle",
       "all_frames": true,
       "match_about_blank": true
