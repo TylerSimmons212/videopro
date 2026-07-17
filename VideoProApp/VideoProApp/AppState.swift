@@ -65,6 +65,7 @@ final class AppState: ObservableObject {
     // MARK: - Lifecycle
 
     func start() {
+        clearOwnQuarantineIfNeeded()
         checkInstallLocation()
         loadLibrary()
         refreshTools()
@@ -155,6 +156,42 @@ final class AppState: ObservableObject {
     }
 
     // MARK: - Install location & installer cleanup
+
+    /// Strip our own `com.apple.quarantine` on launch.
+    ///
+    /// Anything downloaded through a browser gets quarantined. On macOS 27 that
+    /// blocks our bundled Safari Web Extension from registering — the containing
+    /// app is flagged, so `showPreferencesForExtension` returns SFErrorDomain
+    /// error 1 ("no extension found"). The user can't fix it from Terminal
+    /// without granting Full Disk Access (a `com.apple.macl` lock blocks `xattr`
+    /// otherwise), but WE can: a running, non-sandboxed app is allowed to modify
+    /// its own bundle. So clear it here, once, and note if a relaunch is warranted
+    /// so the extension gets re-scanned un-quarantined.
+    private func clearOwnQuarantineIfNeeded() {
+        let bundlePath = Bundle.main.bundlePath
+        // Dev builds in DerivedData are never quarantined; skip the work.
+        guard bundlePath.hasPrefix("/Applications/") || bundlePath.hasPrefix("/Volumes/")
+            || bundlePath.contains("/Downloads/") else { return }
+
+        // Fast check: is the top-level bundle even quarantined?
+        let hasQuarantine = (try? URL(fileURLWithPath: bundlePath)
+            .resourceValues(forKeys: [.quarantinePropertiesKey]))?.quarantineProperties != nil
+        guard hasQuarantine else { return }
+
+        // `xattr -dr` clears it from every nested file, not just the top level.
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/xattr")
+        p.arguments = ["-dr", "com.apple.quarantine", bundlePath]
+        p.standardOutput = Pipe(); p.standardError = Pipe()
+        do {
+            try p.run(); p.waitUntilExit()
+            if p.terminationStatus == 0 {
+                NSLog("VideoPro: cleared own quarantine — Safari extension can now register")
+            }
+        } catch {
+            NSLog("VideoPro: quarantine clear failed: %@", error.localizedDescription)
+        }
+    }
 
     /// If we're running from a DMG or Downloads, offer to move to /Applications
     /// (also required for Safari to load the extension). If already installed,
@@ -662,13 +699,45 @@ final class AppState: ObservableObject {
 
     /// Jump straight to Safari's Extensions settings so the user can enable the
     /// bundled Safari Web Extension.
+    ///
+    /// `showPreferencesForExtension` fails with SFErrorDomain error 1 whenever
+    /// Safari hasn't registered our appex — which, on the current macOS beta,
+    /// PluginKit accepts (`pluginkit -a` exits 0) but silently doesn't honor.
+    /// So on failure we don't dead-end: we open Safari ourselves and offer the
+    /// path that does work here — loading the unpacked folder via Develop → Add
+    /// Temporary Extension.
     func openSafariExtensionSettings() {
         SFSafariApplication.showPreferencesForExtension(withIdentifier: "com.videopro.app.safari") { [weak self] error in
-            guard let error else { return }
-            Task { @MainActor in
-                self?.alert("Couldn’t open Safari settings",
-                            "Open Safari → Settings → Extensions and enable VideoPro.\n\n\(error.localizedDescription)")
-            }
+            guard error != nil else { return }
+            Task { @MainActor in self?.safariFallback() }
+        }
+    }
+
+    private func safariFallback() {
+        // Make sure the unpacked folder exists — the temporary-extension path
+        // needs it — and open Safari so the user is one menu away.
+        let folder = unpackExtension() ?? extensionFolder
+        NSWorkspace.shared.open(URL(fileURLWithPath: "/Applications/Safari.app"))
+
+        let a = NSAlert()
+        a.messageText = "Enable VideoPro in Safari"
+        a.informativeText = """
+        Safari couldn’t open its extension settings automatically (its extension \
+        registration is unreliable on this macOS build).
+
+        Reliable way to load it right now:
+        1.  Safari → Settings → Advanced → tick “Show features for web developers”
+        2.  Develop menu → “Add Temporary Extension…”
+        3.  Choose the folder VideoPro reveals for you
+
+        (Temporary extensions are removed when you quit Safari. A full restart of \
+        your Mac often makes the permanent one appear, since it clears Safari’s \
+        extension cache.)
+        """
+        a.addButton(withTitle: "Reveal Extension Folder")
+        a.addButton(withTitle: "Done")
+        if a.runModal() == .alertFirstButtonReturn {
+            NSWorkspace.shared.activateFileViewerSelecting([folder])
         }
     }
 
