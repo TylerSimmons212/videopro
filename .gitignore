@@ -13,3 +13,4 @@ VideoProApp/VideoProApp/bin/
 # Xcode user state
 xcuserdata/
 *.xcuserstate
+.cache/

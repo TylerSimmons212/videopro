@@ -17,31 +17,52 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PROJ="$ROOT/VideoProApp/VideoProApp.xcodeproj"
 DIST="$ROOT/dist"
+# Cache the downloaded tools OUTSIDE dist/. dist/ gets wiped on every run, so
+# keeping them in there meant a flaky mirror (martin-riedl 522s) destroyed the
+# ability to build at all — right after the old build had been replaced.
+CACHE="$ROOT/.cache/bin"
 BIN="$DIST/bin"
 BUILD="$DIST/build"
 APP="$DIST/VideoPro.app"
 
 rm -rf "$DIST"
-mkdir -p "$BIN" "$BUILD"
+mkdir -p "$BIN" "$BUILD" "$CACHE"
 
-# ── 1. binaries ──────────────────────────────────────────────────────────────
-echo "→ fetching yt-dlp (official standalone)…"
-curl -L --fail --progress-bar \
-  "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_macos" -o "$BIN/yt-dlp"
-chmod +x "$BIN/yt-dlp"
+# ── 1. binaries (cached; re-download only when missing) ──────────────────────
+fetch_retry () {  # $1 = url, $2 = output
+  for attempt in 1 2 3; do
+    curl -L --fail --progress-bar --max-time 180 "$1" -o "$2" && return 0
+    echo "  ⚠ attempt $attempt failed; retrying…" >&2
+    sleep 3
+  done
+  return 1
+}
+
+if [ ! -x "$CACHE/yt-dlp" ]; then
+  echo "→ fetching yt-dlp (official standalone)…"
+  fetch_retry "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_macos" "$CACHE/yt-dlp" \
+    || { echo "✗ couldn't fetch yt-dlp"; exit 1; }
+  chmod +x "$CACHE/yt-dlp"
+fi
 
 ARCH="$(uname -m)"; MR_ARCH="arm64"; [ "$ARCH" = "x86_64" ] && MR_ARCH="amd64"
 fetch_ff () {
-  local name="$1"; echo "→ fetching $name (static, $MR_ARCH)…"
+  local name="$1"
+  [ -x "$CACHE/$name" ] && return 0
+  echo "→ fetching $name (static, $MR_ARCH)…"
   local tmp; tmp="$(mktemp -d)"
-  curl -L --fail --progress-bar \
-    "https://ffmpeg.martin-riedl.de/redirect/latest/macos/$MR_ARCH/release/$name.zip" -o "$tmp/$name.zip"
+  fetch_retry "https://ffmpeg.martin-riedl.de/redirect/latest/macos/$MR_ARCH/release/$name.zip" "$tmp/$name.zip" \
+    || { echo "✗ couldn't fetch $name (mirror down?). Cached copy would have been used if present."; rm -rf "$tmp"; exit 1; }
   ( cd "$tmp" && unzip -oq "$name.zip" )
-  mv "$tmp/$name" "$BIN/$name"; chmod +x "$BIN/$name"; rm -rf "$tmp"
+  mv "$tmp/$name" "$CACHE/$name"; chmod +x "$CACHE/$name"; rm -rf "$tmp"
 }
 fetch_ff ffmpeg
 fetch_ff ffprobe
+
+cp "$CACHE/yt-dlp" "$CACHE/ffmpeg" "$CACHE/ffprobe" "$BIN/"
+chmod +x "$BIN"/*
 xattr -cr "$BIN" 2>/dev/null || true
+echo "✓ tools ready (cached in .cache/bin — delete it to force a refresh)"
 
 # ── 1b. refresh bundled extension ────────────────────────────────────────────
 # extension.zip and the Safari target's Resources are BUILD INPUTS copied from

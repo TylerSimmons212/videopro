@@ -6,6 +6,16 @@
 
 const APP_BASE = "http://127.0.0.1:8787";
 
+// Safari blocks extensions from reaching 127.0.0.1, so /health can never answer
+// there no matter what the app is doing.
+//
+// MUST be declared before init() runs at the bottom of this block: `const` sits
+// in the temporal dead zone until its declaration is evaluated, so declaring it
+// further down made checkApp() throw ReferenceError on its first line. It's
+// fire-and-forget, so the rejection was swallowed — the status pill sat on
+// "Checking app…" forever and every send button stayed disabled.
+const IS_SAFARI = /^((?!chrome|chromium|android).)*safari/i.test(navigator.userAgent);
+
 const els = {
   list: document.getElementById("list"),
   empty: document.getElementById("empty"),
@@ -22,7 +32,13 @@ let sentStore = {}; // sentKey -> timestamp
 init();
 
 async function init() {
-  checkApp();
+  // Don't let this fail silently again — an unhandled rejection here left the
+  // status pill stuck on its initial "Checking app…" with no clue why.
+  checkApp().catch((err) => {
+    console.error("VideoPro: checkApp failed", err);
+    els.status.className = "status status--off";
+    els.statusText.textContent = "Status unavailable";
+  });
   await loadSent();
   els.sendBtn.addEventListener("click", sendAll);
 
@@ -71,10 +87,6 @@ function rememberSent(videos) {
 }
 
 // ── App reachability ─────────────────────────────────────────────────────────
-
-// Safari blocks extensions from reaching 127.0.0.1, so /health can never answer
-// there no matter what the app is doing.
-const IS_SAFARI = /^((?!chrome|chromium|android).)*safari/i.test(navigator.userAgent);
 
 async function checkApp() {
   if (IS_SAFARI) {
@@ -342,7 +354,10 @@ function render(tab) {
     send.title = v.encrypted
       ? "Send to VideoPro (DRM may prevent download)"
       : "Send to the VideoPro app";
-    send.disabled = !appOnline;
+    // Never gate on app reachability: if the app is closed (or we're in Safari,
+    // where /health can't answer at all) the send still works — it hands off via
+    // videopro://, which launches the app and delivers in one step.
+    send.disabled = false;
     send.textContent = "⬇";
     send.addEventListener("click", (e) => { e.stopPropagation(); sendOne(item, send); });
     actions.append(send);
