@@ -3,6 +3,16 @@
     <channel>
         <title>VideoPro</title>
         <item>
+            <title>1.0.9</title>
+            <pubDate>Fri, 17 Jul 2026 17:42:19 -0700</pubDate>
+            <link>https://github.com/TylerSimmons212/videopro</link>
+            <sparkle:version>10009</sparkle:version>
+            <sparkle:shortVersionString>1.0.9</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>26.0</sparkle:minimumSystemVersion>
+            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
+            <enclosure url="https://github.com/TylerSimmons212/videopro/releases/download/v1.0.9/VideoPro-1.0.9.dmg" length="102481079" type="application/octet-stream" sparkle:edSignature="dmFEVXrCnP7UH5LR7xnU/RMwQyxJO12ct6+IFo3jw64jMoSIJGo5BGinLbgQBK8B4OsYWKkFiFbKCK5zpAbdBw=="/>
+        </item>
+        <item>
             <title>1.0.8</title>
             <pubDate>Fri, 17 Jul 2026 02:33:56 -0700</pubDate>
             <link>https://github.com/TylerSimmons212/videopro</link>
