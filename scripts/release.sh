@@ -62,9 +62,15 @@ else
 echo "→ signing with Developer ID + hardened runtime…"
 sign () { codesign --force --options runtime --timestamp -s "$DEVID" "$@"; }
 
-# Bundled tools.
+# Bundled tools. These need disable-library-validation: yt-dlp is a PyInstaller
+# binary that dlopen()s its own Python framework, which Hardened Runtime's library
+# validation rejects once we re-sign with our Team ID — yt-dlp then exits 255 on
+# every download. (This shipped broken in 1.0.8; local ad-hoc builds don't hit it
+# because they aren't hardened.) See scripts/tool-entitlements.plist.
+TOOL_ENTS="$ROOT/scripts/tool-entitlements.plist"
 find "$APP/Contents/Resources/bin" -type f -perm +111 -exec \
-  codesign --force --options runtime --timestamp -s "$DEVID" {} \;
+  codesign --force --options runtime --timestamp \
+    --entitlements "$TOOL_ENTS" -s "$DEVID" {} \;
 
 # Sparkle must be signed INSIDE-OUT. `codesign` on a framework does NOT recurse
 # into nested bundles, so signing only the framework left Autoupdate, Updater.app
@@ -100,6 +106,24 @@ done < <(find "$APP" \( -name "*.xpc" -o -name "*.app" -o -name "*.framework" -o
          find "$APP/Contents/Frameworks" -maxdepth 3 -type f -perm +111 -print 2>/dev/null)
 [ "$ADHOC" -eq 0 ] || { echo "✗ ad-hoc code would fail notarization — aborting"; exit 1; }
 codesign --verify --strict --deep "$APP" && echo "  ✓ signed, no ad-hoc code"
+
+# RUNTIME smoke test — the check that would have caught 1.0.8 shipping broken.
+# `codesign --verify` and notarization both PASS on a yt-dlp that can't actually
+# launch (library validation only bites at dlopen time). So actually run the
+# signed tools and fail if they can't start.
+echo "→ smoke-testing the signed tools (they must actually run)…"
+YTDLP="$APP/Contents/Resources/bin/yt-dlp"
+if ! "$YTDLP" --version >/dev/null 2>&1; then
+  echo "✗ bundled yt-dlp fails to run after signing:"
+  "$YTDLP" --version 2>&1 | head -3 | sed 's/^/    /'
+  echo "  (usually a Hardened Runtime / library-validation issue — see tool-entitlements.plist)"
+  exit 1
+fi
+for t in ffmpeg ffprobe; do
+  "$APP/Contents/Resources/bin/$t" -version >/dev/null 2>&1 \
+    || { echo "✗ bundled $t fails to run after signing"; exit 1; }
+done
+echo "  ✓ yt-dlp $("$YTDLP" --version 2>/dev/null) + ffmpeg/ffprobe run"
 
 # Rebuild the DMG from the now-properly-signed app.
 echo "→ rebuilding DMG from the signed app…"
