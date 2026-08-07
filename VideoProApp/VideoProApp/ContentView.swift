@@ -177,7 +177,6 @@ struct SidebarView: View {
         }
         .listStyle(.sidebar)
         .safeAreaInset(edge: .bottom) { footer }
-        .popover(isPresented: $showNewCollection) { newCollectionForm }
         .sheet(item: $renaming) { c in RenameSheet(collection: c).environmentObject(state) }
     }
 
@@ -226,9 +225,18 @@ struct SidebarView: View {
             }
             .buttonStyle(.plain)
             .foregroundStyle(.secondary)
+            // Anchored to the button rather than to the List, which is what made
+            // it surface in a seemingly arbitrary spot.
+            .popover(isPresented: $showNewCollection, arrowEdge: .trailing) {
+                newCollectionForm
+            }
 
-            statusLine(ok: state.toolsReady,
-                       text: state.toolsReady ? "Ready" : "yt-dlp missing")
+            // No "Ready" badge: a permanent green dot confirming the normal case
+            // is noise. Only the broken case is worth the space, and only because
+            // every download will fail until it's fixed.
+            if !state.toolsReady {
+                statusLine(ok: false, text: "yt-dlp missing")
+            }
         }
         .padding(.horizontal, 12)
         .padding(.bottom, 10)
@@ -313,32 +321,38 @@ struct LibraryView: View {
     }
 
     var body: some View {
-        Group {
-            if state.items.isEmpty {
-                EmptyStateView()
-            } else if scoped.isEmpty {
-                ContentUnavailableView("Nothing here yet", systemImage: scope.systemImage,
-                                       description: Text(emptyScopeHint))
-            } else if visible.isEmpty {
-                ContentUnavailableView.search(text: search)
-            } else {
-                List(selection: $selection) {
-                    ForEach(visible) { item in
-                        VideoRow(item: item,
-                                 onPlay: { play(item) },
-                                 onExport: { convertItem = item },
-                                 selection: selection,
-                                 selectedItems: { selectedItems },
-                                 onRemove: requestRemoval)
-                            .environmentObject(state)
-                            .listRowInsets(EdgeInsets(top: 6, leading: 10, bottom: 6, trailing: 10))
+        // The bar is a sibling of the content rather than a `safeAreaInset`, which
+        // reserved its height even in the branches that don't show it — leaving a
+        // band of dead space under the toolbar on the empty states.
+        VStack(spacing: 0) {
+            if showsFilterBar { filterBar }
+
+            Group {
+                if state.items.isEmpty {
+                    EmptyStateView()
+                } else if scoped.isEmpty {
+                    ContentUnavailableView("Nothing here yet", systemImage: scope.systemImage,
+                                           description: Text(emptyScopeHint))
+                } else if visible.isEmpty {
+                    ContentUnavailableView.search(text: search)
+                } else {
+                    List(selection: $selection) {
+                        ForEach(visible) { item in
+                            VideoRow(item: item,
+                                     onPlay: { play(item) },
+                                     onExport: { convertItem = item },
+                                     selection: selection,
+                                     selectedItems: { selectedItems },
+                                     onRemove: requestRemoval)
+                                .environmentObject(state)
+                                .listRowInsets(EdgeInsets(top: 6, leading: 10, bottom: 6, trailing: 10))
+                        }
                     }
+                    .listStyle(.inset)
                 }
-                .listStyle(.inset)
-                .alternatingRowBackgrounds()
             }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
-        .safeAreaInset(edge: .top) { if !state.items.isEmpty { filterBar } }
         // A filter or sort change must not silently widen or narrow what a
         // batch action is about to hit, so anything that scrolls out of the
         // filtered set leaves the selection with it.
@@ -482,6 +496,13 @@ struct LibraryView: View {
             let c = state.createCollection(named: "Untitled Collection")
             for item in targets { state.add(item, to: c.id) }
         }
+    }
+
+    /// The bar has nothing useful to say when the library is empty, or when a
+    /// scope holds too little to be worth filtering — so it stays out entirely
+    /// rather than showing a row of dead controls.
+    private var showsFilterBar: Bool {
+        selection.count > 1 || (!state.items.isEmpty && !scoped.isEmpty)
     }
 
     /// Status as chips. One click, no navigation, and they disappear entirely
