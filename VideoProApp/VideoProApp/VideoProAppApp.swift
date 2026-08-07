@@ -83,11 +83,26 @@ struct VideoProApp: App {
         }
 
         // One window per video, opened with `openWindow(value:)` from the library.
+        //
+        // Restoration is off deliberately. `WindowGroup(for:)` persists its value
+        // across launches, which would reopen a player pointing at whatever URL it
+        // had — and for a stream that's a signed CDN link that has since expired.
+        // VideoItem takes the same position on purpose (see `playURL`: "Deliberately
+        // NOT persisted … a stale one from a previous launch would 403"); restoring
+        // here would quietly reintroduce exactly that, as a blank player rather than
+        // an error. Playback is cheap to restart from the library.
         WindowGroup(for: PlayerContext.self) { $context in
             PlayerWindowView(context: context)
         }
         .defaultSize(width: 900, height: 560)
         .windowResizability(.contentMinSize)
+        .restorationBehavior(.disabled)
+
+        // ⌘, — preferences belong in a window, not in a toolbar popover.
+        Settings {
+            SettingsView()
+                .environmentObject(state)
+        }
 
         // The one-off path: grab a video without ever opening the window.
         MenuBarExtra("VideoPro", systemImage: "arrow.down.circle") {
