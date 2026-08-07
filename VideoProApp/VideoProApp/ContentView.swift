@@ -279,7 +279,6 @@ struct LibraryView: View {
 
     @State private var playerItem: PlayerContext?
     @State private var convertItem: VideoItem?
-    @State private var showSettings = false
     @State private var showAddURL = false
     @State private var showActivity = false
     @State private var urlText = ""
@@ -424,12 +423,6 @@ struct LibraryView: View {
                 } } label: { Image(systemName: "arrow.down.to.line") }
                     .help("Download everything shown")
             }
-
-            Button { showSettings.toggle() } label: { Image(systemName: "slider.horizontal.3") }
-                .help("Settings")
-                .popover(isPresented: $showSettings, arrowEdge: .bottom) {
-                    SettingsPopover().environmentObject(state)
-                }
         }
     }
 
@@ -799,116 +792,6 @@ struct QualityPopover: View {
     }
 }
 
-// MARK: - Settings
-
-struct SettingsPopover: View {
-    @EnvironmentObject var state: AppState
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            Text("Download Settings").font(.headline)
-
-            VStack(alignment: .leading, spacing: 6) {
-                Text("Default quality").font(.caption).foregroundStyle(.secondary)
-                Picker("", selection: $state.defaultQuality) {
-                    ForEach(DownloadQuality.allCases) { Text($0.rawValue).tag($0) }
-                }
-                .labelsHidden().pickerStyle(.menu)
-            }
-
-            Toggle(isOn: $state.embedSubtitles) {
-                Label("Embed subtitles (when available)", systemImage: "captions.bubble")
-            }
-            Toggle(isOn: $state.embedThumbnail) {
-                Label("Embed thumbnail", systemImage: "photo")
-            }
-
-            Divider()
-
-            VStack(alignment: .leading, spacing: 6) {
-                Text("Save to").font(.caption).foregroundStyle(.secondary)
-                HStack {
-                    Text(state.downloadFolder.path)
-                        .font(.caption).lineLimit(1).truncationMode(.middle)
-                        .foregroundStyle(.secondary)
-                    Spacer()
-                    Button("Change…") { state.chooseDownloadFolder() }
-                        .controlSize(.small)
-                }
-            }
-
-            Divider()
-
-            FastPathSettings()
-
-            Divider()
-
-            ExtensionSetupView()
-
-            Divider()
-
-            VStack(alignment: .leading, spacing: 6) {
-                Text("Connection").font(.caption).foregroundStyle(.secondary)
-                HStack(spacing: 7) {
-                    Circle()
-                        .fill(state.serverRunning ? Color.green : Color.orange)
-                        .frame(width: 8, height: 8)
-                    Text(state.serverRunning
-                         ? "Active · listening on 127.0.0.1:\(state.port)"
-                         : state.serverStatus)
-                        .font(.caption).foregroundStyle(.secondary)
-                        .lineLimit(2)
-                }
-            }
-
-            Divider()
-            Label(state.toolSummary, systemImage: state.toolsReady ? "checkmark.seal.fill" : "exclamationmark.triangle.fill")
-                .font(.caption)
-                .foregroundStyle(state.toolsReady ? .green : .orange)
-                .lineLimit(2)
-        }
-        .padding(16)
-        .frame(width: 320)
-    }
-}
-
-// MARK: - Fast path settings
-
-/// The grab-a-video-without-the-window controls: global hotkey and cookie source.
-struct FastPathSettings: View {
-    @EnvironmentObject var state: AppState
-    @State private var browsers: [BrowserTarget] = []
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text("Quick grab").font(.caption).foregroundStyle(.secondary)
-
-            Toggle(isOn: $state.hotKeyEnabled) {
-                Label("Global shortcut (\(GlobalHotKey.displayName))", systemImage: "keyboard")
-            }
-            Text("Grabs the video from whichever browser you were last in.")
-                .font(.system(size: 10)).foregroundStyle(.secondary)
-
-            Picker("Sign-in cookies", selection: $state.cookieBrowserID) {
-                Text("Don’t use cookies").tag(String?.none)
-                ForEach(browsers) { b in
-                    Text(b.name).tag(String?.some(b.id))
-                }
-            }
-            .pickerStyle(.menu)
-            .controlSize(.small)
-
-            // Say what it buys and what it costs, before they pick — both failure
-            // modes here are opaque if you meet them cold.
-            Text(state.cookieBrowser.flatMap(\.cookieCaveat)
-                 ?? "Needed for private, members-only, or age-restricted videos.")
-                .font(.system(size: 10)).foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-        }
-        .onAppear { browsers = BrowserScan.installed().filter { $0.cookieSpec != nil } }
-    }
-}
-
 // MARK: - Convert / trim
 
 struct ConvertSheet: View {
@@ -994,89 +877,6 @@ struct ConvertSheet: View {
         case 2: return parts[0] * 60 + parts[1]
         case 1: return parts[0]
         default: return 0
-        }
-    }
-}
-
-// MARK: - Extension setup
-
-/// Lists the browsers actually installed on this Mac and sets the extension up in
-/// the one you pick.
-///
-/// The old flow hard-coded "Chrome" and told you to open `chrome://extensions` —
-/// useless if you don't have Chrome (Arc, Brave and Edge users got no working path
-/// at all). It also never told you whether setup had actually worked.
-struct ExtensionSetupView: View {
-    @EnvironmentObject var state: AppState
-    @State private var chromium: [BrowserTarget] = []
-    @State private var safari: BrowserTarget?
-    @State private var sheetBrowser: BrowserTarget?
-    /// Ticks so "last seen" stays honest while the popover is open.
-    @State private var now = Date()
-    private let tick = Timer.publish(every: 5, on: .main, in: .common).autoconnect()
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 9) {
-            Text("Browser extension").font(.caption).foregroundStyle(.secondary)
-
-            // Say plainly whether it's working — no guessing.
-            HStack(spacing: 7) {
-                Circle()
-                    .fill(state.extensionStatus.connected ? Color.green : Color.secondary.opacity(0.5))
-                    .frame(width: 8, height: 8)
-                Text(state.extensionStatus.text).font(.caption)
-                    .foregroundStyle(state.extensionStatus.connected ? .primary : .secondary)
-            }
-
-            if chromium.isEmpty && safari == nil {
-                Text("No supported browser found.")
-                    .font(.caption2).foregroundStyle(.secondary)
-            }
-
-            ForEach(chromium) { b in
-                browserRow(
-                    name: b.name,
-                    detail: "Guided setup — takes about 20 seconds",
-                    action: { sheetBrowser = b },
-                    label: "Set up…"
-                )
-            }
-
-            if let s = safari {
-                browserRow(
-                    name: s.name,
-                    detail: "Enable in Safari’s Extensions settings",
-                    action: { state.openSafariExtensionSettings() },
-                    label: "Enable…"
-                )
-            }
-
-            Text(state.extensionFolder.path)
-                .font(.system(size: 9, design: .monospaced))
-                .foregroundStyle(.tertiary)
-                .lineLimit(1).truncationMode(.middle)
-                .textSelection(.enabled)
-        }
-        .onAppear {
-            chromium = BrowserScan.chromiumInstalled()
-            safari = BrowserScan.safariInstalled()
-        }
-        .onReceive(tick) { now = $0 }
-        .sheet(item: $sheetBrowser) { b in
-            ExtensionInstallSheet(browser: b).environmentObject(state)
-        }
-    }
-
-    @ViewBuilder
-    private func browserRow(name: String, detail: String,
-                            action: @escaping () -> Void, label: String) -> some View {
-        HStack(spacing: 8) {
-            VStack(alignment: .leading, spacing: 1) {
-                Text(name).font(.caption).fontWeight(.medium)
-                Text(detail).font(.system(size: 10)).foregroundStyle(.secondary)
-            }
-            Spacer()
-            Button(label, action: action).controlSize(.small)
         }
     }
 }

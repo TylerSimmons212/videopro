@@ -82,6 +82,12 @@ struct VideoProApp: App {
             }
         }
 
+        // ⌘, — preferences belong in a window, not in a toolbar popover.
+        Settings {
+            SettingsView()
+                .environmentObject(state)
+        }
+
         // The one-off path: grab a video without ever opening the window.
         MenuBarExtra("VideoPro", systemImage: "arrow.down.circle") {
             MenuBarContent().environmentObject(state)
