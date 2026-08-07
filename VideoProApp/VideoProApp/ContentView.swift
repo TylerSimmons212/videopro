@@ -285,6 +285,8 @@ struct LibraryView: View {
     @State private var search = ""
     @State private var status: StatusFilter = .all
     @State private var sort: LibrarySort = .newest
+    @State private var selection = Set<UUID>()
+    @State private var pendingRemoval: [VideoItem] = []
 
     /// Everything in this scope, before the status chips and search narrow it —
     /// used so the chips can show counts and hide themselves when irrelevant.
@@ -303,6 +305,13 @@ struct LibraryView: View {
         return sort.apply(list)
     }
 
+    /// Selection resolved back to items, in the order they appear on screen.
+    /// Everything batch acts on goes through here, so an action can never touch
+    /// a row the filters have hidden.
+    private var selectedItems: [VideoItem] {
+        visible.filter { selection.contains($0.id) }
+    }
+
     var body: some View {
         Group {
             if state.items.isEmpty {
@@ -313,11 +322,14 @@ struct LibraryView: View {
             } else if visible.isEmpty {
                 ContentUnavailableView.search(text: search)
             } else {
-                List {
+                List(selection: $selection) {
                     ForEach(visible) { item in
                         VideoRow(item: item,
                                  onPlay: { play(item) },
-                                 onExport: { convertItem = item })
+                                 onExport: { convertItem = item },
+                                 selection: selection,
+                                 selectedItems: { selectedItems },
+                                 onRemove: requestRemoval)
                             .environmentObject(state)
                             .listRowInsets(EdgeInsets(top: 6, leading: 10, bottom: 6, trailing: 10))
                     }
@@ -327,6 +339,25 @@ struct LibraryView: View {
             }
         }
         .safeAreaInset(edge: .top) { if !state.items.isEmpty { filterBar } }
+        // A filter or sort change must not silently widen or narrow what a
+        // batch action is about to hit, so anything that scrolls out of the
+        // filtered set leaves the selection with it.
+        .onChange(of: Set(visible.map(\.id))) { _, ids in
+            if !selection.isEmpty { selection.formIntersection(ids) }
+        }
+        .background { selectionShortcuts }
+        .confirmationDialog("Remove \(pendingRemoval.count) videos from your library?",
+                            isPresented: Binding(get: { !pendingRemoval.isEmpty },
+                                                 set: { if !$0 { pendingRemoval = [] } })) {
+            Button("Remove \(pendingRemoval.count) Videos", role: .destructive) {
+                state.remove(pendingRemoval)
+                selection.subtract(pendingRemoval.map(\.id))
+                pendingRemoval = []
+            }
+            Button("Cancel", role: .cancel) { pendingRemoval = [] }
+        } message: {
+            Text("The downloaded files stay on disk.")
+        }
         .navigationTitle(title)
         .navigationSubtitle(subtitle)
         .searchable(text: $search, placement: .toolbar, prompt: "Search videos")
@@ -359,9 +390,111 @@ struct LibraryView: View {
         return base
     }
 
+    /// Removing one or two is an obvious, easily-redone gesture; removing a
+    /// sweep of rows the user may have selected by accident is not.
+    private func requestRemoval(_ batch: [VideoItem]) {
+        guard !batch.isEmpty else { return }
+        if batch.count > 2 {
+            pendingRemoval = batch
+        } else {
+            state.remove(batch)
+            selection.subtract(batch.map(\.id))
+        }
+    }
+
+    /// Zero-sized buttons purely to carry the key equivalents. Escape only
+    /// exists while something is selected so it doesn't shadow sheet dismissal.
+    @ViewBuilder private var selectionShortcuts: some View {
+        Button("") { selection = Set(visible.map(\.id)) }
+            .keyboardShortcut("a", modifiers: .command)
+            .frame(width: 0, height: 0).opacity(0)
+        if !selection.isEmpty {
+            Button("") { selection.removeAll() }
+                .keyboardShortcut(.escape, modifiers: [])
+                .frame(width: 0, height: 0).opacity(0)
+        }
+    }
+
+    /// The filter bar's slot, taken over while a multi-selection is live.
+    /// Chips and sort are irrelevant mid-batch, and this keeps the actions in
+    /// the one place the eye is already using to steer the list.
+    @ViewBuilder private var batchBar: some View {
+        let targets = selectedItems
+        let downloadable = targets.filter { $0.status == .idle || $0.status == .error }
+        let promotable = targets.filter { $0.meta.tier == .inbox }
+
+        HStack(spacing: 8) {
+            Text("\(targets.count) selected")
+                .font(.caption).fontWeight(.medium)
+
+            Divider().frame(height: 14)
+
+            Button {
+                for item in downloadable { state.download(item) }
+            } label: {
+                Label("Download \(downloadable.count)", systemImage: "arrow.down.to.line")
+            }
+            .disabled(downloadable.isEmpty)
+
+            Menu {
+                collectionMenuItems(for: targets)
+            } label: {
+                Label("Add to Collection", systemImage: "folder.badge.plus")
+            }
+            .fixedSize()
+
+            if !promotable.isEmpty {
+                Button {
+                    for item in promotable { state.promote(item) }
+                } label: {
+                    Label("Keep", systemImage: "pin")
+                }
+                .help("Keep these in the library instead of letting the Inbox expire them")
+            }
+
+            Button(role: .destructive) {
+                requestRemoval(targets)
+            } label: {
+                Label("Remove", systemImage: "trash")
+            }
+
+            Spacer()
+
+            Button("Done") { selection.removeAll() }
+        }
+        .labelStyle(.titleAndIcon)
+        .controlSize(.small)
+        .padding(.horizontal, 12).padding(.vertical, 5)
+        .background(.bar)
+    }
+
+    /// Disabled only when *every* target is already filed there — otherwise the
+    /// menu item still has work to do for the rest of the selection.
+    @ViewBuilder private func collectionMenuItems(for targets: [VideoItem]) -> some View {
+        ForEach(state.collections) { c in
+            Button(c.name) {
+                for item in targets { state.add(item, to: c.id) }
+            }
+            .disabled(targets.allSatisfy { $0.meta.collectionIDs.contains(c.id) })
+        }
+        if !state.collections.isEmpty { Divider() }
+        Button("New Collection…") {
+            let c = state.createCollection(named: "Untitled Collection")
+            for item in targets { state.add(item, to: c.id) }
+        }
+    }
+
     /// Status as chips. One click, no navigation, and they disappear entirely
     /// when the current scope has nothing in flight.
     @ViewBuilder private var filterBar: some View {
+        if selection.count > 1 {
+            batchBar
+        } else {
+            statusFilterBar
+        }
+    }
+
+    @ViewBuilder private var statusFilterBar: some View {
         let counts = Dictionary(grouping: scoped, by: { item -> StatusFilter in
             if item.status == .downloading || item.status == .queued { return .downloading }
             if item.status == .done { return .done }
@@ -547,6 +680,13 @@ struct VideoRow: View {
     @ObservedObject var item: VideoItem
     let onPlay: () -> Void
     var onExport: () -> Void = {}
+    /// The live list selection, so the row can tell whether a right-click on it
+    /// is a right-click on the whole selection.
+    var selection: Set<UUID> = []
+    var selectedItems: () -> [VideoItem] = { [] }
+    /// Removal goes back up: only the list knows whether a batch is big enough
+    /// to deserve a confirmation.
+    var onRemove: ([VideoItem]) -> Void = { _ in }
     @State private var showQuality = false
     @State private var hovering = false
 
@@ -604,7 +744,46 @@ struct VideoRow: View {
         item.status == .downloading || item.status == .queued
     }
 
+    /// macOS convention: right-clicking inside a multi-selection acts on the
+    /// whole selection; right-clicking outside it acts on that row alone.
     @ViewBuilder private var contextMenu: some View {
+        if selection.count > 1, selection.contains(item.id) {
+            batchMenu(selectedItems())
+        } else {
+            singleMenu
+        }
+    }
+
+    @ViewBuilder private func batchMenu(_ targets: [VideoItem]) -> some View {
+        let downloadable = targets.filter { $0.status == .idle || $0.status == .error }
+        let promotable = targets.filter { $0.meta.tier == .inbox }
+
+        if !downloadable.isEmpty {
+            Button("Download \(downloadable.count) Videos") {
+                for i in downloadable { state.download(i) }
+            }
+        }
+        if !promotable.isEmpty {
+            Button("Keep \(promotable.count) in Library") {
+                for i in promotable { state.promote(i) }
+            }
+        }
+        Menu("Add \(targets.count) to Collection") {
+            ForEach(state.collections) { c in
+                Button(c.name) { for i in targets { state.add(i, to: c.id) } }
+                    .disabled(targets.allSatisfy { $0.meta.collectionIDs.contains(c.id) })
+            }
+            if !state.collections.isEmpty { Divider() }
+            Button("New Collection…") {
+                let c = state.createCollection(named: "Untitled Collection")
+                for i in targets { state.add(i, to: c.id) }
+            }
+        }
+        Divider()
+        Button("Remove \(targets.count) Videos", role: .destructive) { onRemove(targets) }
+    }
+
+    @ViewBuilder private var singleMenu: some View {
         Button("Play", action: onPlay)
         if item.status == .idle || item.status == .error {
             Button("Download") { state.download(item) }
@@ -642,7 +821,7 @@ struct VideoRow: View {
             }
         }
         Divider()
-        Button("Remove", role: .destructive) { state.remove(item) }
+        Button("Remove", role: .destructive) { onRemove([item]) }
     }
 
     @ViewBuilder private var statusView: some View {
