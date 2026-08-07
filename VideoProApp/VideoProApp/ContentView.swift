@@ -277,7 +277,7 @@ struct LibraryView: View {
     @EnvironmentObject var state: AppState
     let scope: LibraryScope
 
-    @State private var playerItem: PlayerContext?
+    @Environment(\.openWindow) private var openWindow
     @State private var convertItem: VideoItem?
     @State private var showSettings = false
     @State private var showAddURL = false
@@ -332,7 +332,6 @@ struct LibraryView: View {
         .navigationSubtitle(subtitle)
         .searchable(text: $search, placement: .toolbar, prompt: "Search videos")
         .toolbar { toolbarContent }
-        .sheet(item: $playerItem) { PlayerSheet(context: $0) }
         .sheet(item: $convertItem) { ConvertSheet(item: $0).environmentObject(state) }
     }
 
@@ -461,14 +460,14 @@ struct LibraryView: View {
 
     private func play(_ item: VideoItem) {
         if let url = item.warmPlayURL {
-            playerItem = PlayerContext(url: url, title: item.meta.title)
+            openWindow(value: PlayerContext(url: url, title: item.meta.title))
             return
         }
         item.statusLine = "Resolving stream…"
         Task {
             if let url = await DownloadManager.shared.resolvePlayableURL(for: item.meta) {
                 item.setPlayURL(url, expires: DownloadManager.expiry(for: url.absoluteString))
-                playerItem = PlayerContext(url: url, title: item.meta.title)
+                openWindow(value: PlayerContext(url: url, title: item.meta.title))
                 item.statusLine = ""
             } else {
                 item.statusLine = "Couldn't resolve a playable stream"
@@ -1412,40 +1411,6 @@ struct ThumbView: View {
 }
 
 // MARK: - Player
-
-struct PlayerContext: Identifiable {
-    let id = UUID()
-    let url: URL
-    let title: String
-}
-
-struct PlayerSheet: View {
-    let context: PlayerContext
-    @Environment(\.dismiss) private var dismiss
-    @State private var player: AVPlayer
-
-    init(context: PlayerContext) {
-        self.context = context
-        _player = State(initialValue: AVPlayer(url: context.url))
-    }
-
-    var body: some View {
-        VStack(spacing: 0) {
-            HStack {
-                Text(context.title).font(.headline).lineLimit(1)
-                Spacer()
-                Button("Done") { player.pause(); dismiss() }.buttonStyle(.glass)
-            }
-            .padding(12)
-            PlayerView(player: player)
-                .frame(minWidth: 720, minHeight: 405)
-        }
-        .frame(minWidth: 720, minHeight: 460)
-        .background(.black)
-        .onAppear { player.play() }
-        .onDisappear { player.pause() }
-    }
-}
 
 /// AppKit AVPlayerView wrapped for SwiftUI. Using this instead of SwiftUI's
 /// `VideoPlayer` avoids a metadata crash in _AVKit_SwiftUI on some macOS builds.

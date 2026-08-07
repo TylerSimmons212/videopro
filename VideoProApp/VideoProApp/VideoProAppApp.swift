@@ -82,6 +82,13 @@ struct VideoProApp: App {
             }
         }
 
+        // One window per video, opened with `openWindow(value:)` from the library.
+        WindowGroup(for: PlayerContext.self) { $context in
+            PlayerWindowView(context: context)
+        }
+        .defaultSize(width: 900, height: 560)
+        .windowResizability(.contentMinSize)
+
         // The one-off path: grab a video without ever opening the window.
         MenuBarExtra("VideoPro", systemImage: "arrow.down.circle") {
             MenuBarContent().environmentObject(state)
