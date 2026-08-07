@@ -646,22 +646,24 @@ struct ActivityPopover: View {
 
 // MARK: - Backdrop
 
+/// Backdrop for full-bleed surfaces (onboarding).
+///
+/// Achromatic on purpose. This was a hardcoded dark purple gradient with no
+/// light-mode variant, so in Light Mode it rendered as a dark slab in an
+/// otherwise light window — and worse, `.regularMaterial` cards over it degraded
+/// into opaque grey bricks, which made the content look broken rather than just
+/// the background. Depth now comes from value instead of hue, so it reads
+/// correctly in both appearances and can never fight the user's accent colour.
 struct BackdropView: View {
+    @Environment(\.colorScheme) private var scheme
+
     var body: some View {
         ZStack {
+            Color(nsColor: .windowBackgroundColor)
             LinearGradient(
-                colors: [Color(red: 0.10, green: 0.09, blue: 0.20),
-                         Color(red: 0.05, green: 0.05, blue: 0.10)],
-                startPoint: .topLeading, endPoint: .bottomTrailing
+                colors: [Color.primary.opacity(scheme == .dark ? 0.07 : 0.045), .clear],
+                startPoint: .top, endPoint: .center
             )
-            Circle()
-                .fill(Color(red: 0.42, green: 0.36, blue: 0.90).opacity(0.45))
-                .frame(width: 420).blur(radius: 140)
-                .offset(x: -160, y: -220)
-            Circle()
-                .fill(Color(red: 0.20, green: 0.55, blue: 0.95).opacity(0.35))
-                .frame(width: 380).blur(radius: 150)
-                .offset(x: 180, y: 260)
         }
         .ignoresSafeArea()
     }
@@ -718,7 +720,7 @@ struct VideoRow: View {
                     .truncationMode(.middle)
 
                 HStack(spacing: 5) {
-                    if let p = item.meta.platform, !p.isEmpty { Pill(text: p, tint: .purple) }
+                    if let p = item.meta.platform, !p.isEmpty { Pill(text: p, tint: .accentColor) }
                     if let d = item.meta.prettyDuration { Pill(text: d) }
                     if item.meta.height > 0 { Pill(text: "\(item.meta.height)p") }
                     if let host = URL(string: item.meta.downloadURL)?.host {
@@ -843,7 +845,7 @@ struct VideoRow: View {
         case .downloading:
             HStack(spacing: 7) {
                 ProgressView(value: item.progress)
-                    .progressViewStyle(.linear).tint(.purple)
+                    .progressViewStyle(.linear)
                     .frame(width: 130)
                 Text("\(Int(item.progress * 100))%")
                     .font(.caption2).monospacedDigit().foregroundStyle(.secondary)
@@ -892,7 +894,7 @@ struct VideoRow: View {
                     Image(systemName: "arrow.down.to.line").font(.system(size: 11))
                         .frame(width: 26, height: 22)
                 }
-                .buttonStyle(.borderedProminent).tint(.purple)
+                .buttonStyle(.borderedProminent)
                 .help("Download…")
                 .popover(isPresented: $showQuality, arrowEdge: .trailing) {
                     QualityPopover(item: item) { quality in
@@ -942,7 +944,7 @@ struct QualityPopover: View {
                 } label: {
                     HStack {
                         Image(systemName: q.isAudioOnly ? "music.note" : "film")
-                            .foregroundStyle(q.isAudioOnly ? .pink : .purple)
+                            .foregroundStyle(q.isAudioOnly ? Color.pink : Color.accentColor)
                             .frame(width: 18)
                         Text(q.rawValue)
                         Spacer()
@@ -1079,7 +1081,7 @@ struct ExtensionInstallSheet: View {
         VStack(alignment: .leading, spacing: 14) {
             HStack(spacing: 9) {
                 Image(systemName: "puzzlepiece.extension.fill")
-                    .font(.title2).foregroundStyle(.purple)
+                    .font(.title2).foregroundStyle(.tint)
                 VStack(alignment: .leading, spacing: 1) {
                     Text("Set up in \(browser.name)").font(.title3).fontWeight(.bold)
                     Text("VideoPro opened \(browser.name)’s Extensions page and copied the folder path.")
@@ -1157,7 +1159,7 @@ struct ExtensionInstallSheet: View {
             Text("\(n)")
                 .font(.caption2).fontWeight(.bold).foregroundStyle(.white)
                 .frame(width: 16, height: 16)
-                .background(.purple, in: .circle)
+                .background(.tint, in: .circle)
             Text(.init(markdown)).font(.callout)
         }
     }
@@ -1178,7 +1180,7 @@ struct OnboardingView: View {
             BackdropView()
             VStack(spacing: 16) {
                 Image(systemName: "play.rectangle.on.rectangle.fill")
-                    .font(.system(size: 46)).foregroundStyle(.purple.gradient)
+                    .font(.system(size: 46)).foregroundStyle(Color.accentColor.gradient)
                 Text("Welcome to VideoPro").font(.title2).fontWeight(.bold)
                 Text("Find videos in your browser, then send them here to play or download.")
                     .font(.callout).foregroundStyle(.secondary)
@@ -1200,7 +1202,7 @@ struct OnboardingView: View {
                             Label("Install in \(b.name)", systemImage: "arrow.down.circle.fill")
                                 .frame(maxWidth: .infinity)
                         }
-                        .buttonStyle(.glassProminent).tint(.purple).controlSize(.large)
+                        .buttonStyle(.glassProminent).controlSize(.large)
                     }
 
                     if safari != nil {
@@ -1256,7 +1258,7 @@ struct EmptyStateView: View {
         VStack(spacing: 14) {
             Image(systemName: "tray.and.arrow.down.fill")
                 .font(.system(size: 46))
-                .foregroundStyle(.purple.gradient)
+                .foregroundStyle(Color.accentColor.gradient)
             Text("No videos yet").font(.title3).fontWeight(.semibold)
             Text("Find a video in your browser and click **Send to VideoPro**.")
                 .font(.callout).foregroundStyle(.secondary)
