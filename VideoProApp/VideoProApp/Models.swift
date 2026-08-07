@@ -3,6 +3,17 @@ import Combine
 
 // MARK: - Persisted / wire data
 
+/// Whether an item is passing through or has been deliberately kept.
+///
+/// Everything arrives in `.inbox` and ages out of the library view on its own —
+/// the file on disk is never touched, only the entry. Acting on an item in a way
+/// that implies intent (tagging it, adding it to a collection, editing it)
+/// promotes it to `.kept`, where it stays until removed by hand. This is what
+/// lets a one-off grab leave no mess without making the collector clean up.
+enum LibraryTier: String, Codable, Sendable {
+    case inbox, kept
+}
+
 /// Pure, Codable, Sendable description of a video. This is what travels over the
 /// HTTP bridge from the extension and what we persist to disk.
 struct VideoMeta: Codable, Equatable, Identifiable, Sendable {
@@ -18,6 +29,49 @@ struct VideoMeta: Codable, Equatable, Identifiable, Sendable {
     var platform: String?        // "YouTube", "Vimeo", ...
     var receivedAt: Date = Date()
     var downloadedPath: String? = nil   // set once successfully downloaded
+
+    var tier: LibraryTier = .inbox
+    var tags: [String] = []
+    var collectionIDs: [UUID] = []
+
+    /// Decoded by hand so libraries written before these fields existed still
+    /// load. Swift's synthesised `Decodable` throws on a missing key even when the
+    /// property has a default, so every new field has to be `decodeIfPresent`.
+    /// Pre-existing items are treated as `.kept`: they predate the Inbox concept,
+    /// and quietly expiring somebody's existing library would be indefensible.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decodeIfPresent(UUID.self, forKey: .id) ?? UUID()
+        title = try c.decodeIfPresent(String.self, forKey: .title) ?? "Untitled video"
+        pageURL = try c.decodeIfPresent(String.self, forKey: .pageURL) ?? ""
+        mediaURL = try c.decodeIfPresent(String.self, forKey: .mediaURL) ?? ""
+        sourceKind = try c.decodeIfPresent(String.self, forKey: .sourceKind) ?? "stream"
+        thumbnail = try c.decodeIfPresent(String.self, forKey: .thumbnail) ?? ""
+        duration = try c.decodeIfPresent(Double.self, forKey: .duration)
+        width = try c.decodeIfPresent(Int.self, forKey: .width) ?? 0
+        height = try c.decodeIfPresent(Int.self, forKey: .height) ?? 0
+        platform = try c.decodeIfPresent(String.self, forKey: .platform)
+        receivedAt = try c.decodeIfPresent(Date.self, forKey: .receivedAt) ?? Date()
+        downloadedPath = try c.decodeIfPresent(String.self, forKey: .downloadedPath)
+        tier = try c.decodeIfPresent(LibraryTier.self, forKey: .tier) ?? .kept
+        tags = try c.decodeIfPresent([String].self, forKey: .tags) ?? []
+        collectionIDs = try c.decodeIfPresent([UUID].self, forKey: .collectionIDs) ?? []
+    }
+
+    init(title: String, pageURL: String, mediaURL: String, sourceKind: String,
+         thumbnail: String, duration: Double?, width: Int, height: Int,
+         platform: String?, tier: LibraryTier = .inbox) {
+        self.title = title
+        self.pageURL = pageURL
+        self.mediaURL = mediaURL
+        self.sourceKind = sourceKind
+        self.thumbnail = thumbnail
+        self.duration = duration
+        self.width = width
+        self.height = height
+        self.platform = platform
+        self.tier = tier
+    }
 
     /// The URL we hand to yt-dlp. Prefer the page URL for platform pages,
     /// otherwise fall back to the direct media URL.
@@ -61,6 +115,18 @@ struct VideoMeta: Codable, Equatable, Identifiable, Sendable {
             .lowercased() else { return false }
         return platformHosts.contains(where: { host == $0 || host.hasSuffix("." + $0) })
     }
+}
+
+// MARK: - Collections
+
+/// A user-made grouping. Ordered, because a collection is also the sequence the
+/// collection builder will concatenate (see PLAN.md M6) — so the order the user
+/// arranges here is the order clips play in.
+struct VideoCollection: Codable, Identifiable, Equatable, Sendable {
+    var id: UUID = UUID()
+    var name: String
+    var ordering: [UUID] = []
+    var createdAt: Date = Date()
 }
 
 // MARK: - Live UI item
@@ -162,7 +228,18 @@ final class VideoItem: ObservableObject, Identifiable {
     var meta: VideoMeta          // thumbnail may be upgraded after enrichment
     var id: UUID { meta.id }
 
-    @Published var status: DownloadStatus = .idle
+    /// Fires when *any* item changes status.
+    ///
+    /// Views that filter or count by status (sidebar badges, the status chips)
+    /// observe AppState, but status lives on VideoItem — so those counts only
+    /// refreshed when something unrelated on AppState happened to publish. This
+    /// closes that gap. Deliberately status-only: routing `progress` through here
+    /// would rebuild the whole list several times a second.
+    static let statusChanged = PassthroughSubject<Void, Never>()
+
+    @Published var status: DownloadStatus = .idle {
+        didSet { if oldValue != status { Self.statusChanged.send() } }
+    }
     @Published var progress: Double = 0        // 0...1
     @Published var statusLine: String = ""     // last human-readable line
     @Published var outputPath: String = ""     // final file once known

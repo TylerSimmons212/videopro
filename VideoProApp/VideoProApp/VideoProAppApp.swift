@@ -76,6 +76,51 @@ struct VideoProApp: App {
             CommandGroup(after: .appInfo) {
                 CheckForUpdatesView(updater: updater)
             }
+            CommandGroup(after: .newItem) {
+                Button("Grab Front Tab") { state.grabFrontTab() }
+                    .keyboardShortcut("g", modifiers: [.command, .shift])
+            }
         }
+
+        // The one-off path: grab a video without ever opening the window.
+        MenuBarExtra("VideoPro", systemImage: "arrow.down.circle") {
+            MenuBarContent().environmentObject(state)
+        }
+    }
+}
+
+/// Menu bar contents. Deliberately tiny — this surface exists to make a one-off
+/// grab take one click, not to be a second copy of the app.
+struct MenuBarContent: View {
+    @EnvironmentObject var state: AppState
+
+    var body: some View {
+        // Menus are rebuilt each time they open, so reading this directly picks up
+        // a browser change without needing to observe anything.
+        let frontTab = FrontTab.shared
+        // Naming the browser makes the action predictable — otherwise "Grab Front
+        // Tab" is a coin flip when several browsers are open.
+        Button(frontTab.target.map { "Grab Front Tab from \($0.name)" } ?? "No browser open") {
+            state.grabFrontTab()
+        }
+        .disabled(frontTab.target == nil)
+
+        Button("Paste URL and Download") {
+            let pasted = NSPasteboard.general.string(forType: .string) ?? ""
+            if let item = state.addURL(pasted) { state.download(item) }
+        }
+
+        if state.activeDownloads + state.queuedCount > 0 {
+            Divider()
+            Text("\(state.activeDownloads) downloading, \(state.queuedCount) queued")
+        }
+
+        Divider()
+        Button("Open VideoPro") {
+            NSApp.activate(ignoringOtherApps: true)
+            NSApp.windows.first { $0.canBecomeMain }?.makeKeyAndOrderFront(nil)
+        }
+        Button("Quit VideoPro") { NSApp.terminate(nil) }
+            .keyboardShortcut("q")
     }
 }

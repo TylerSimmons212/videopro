@@ -13,6 +13,42 @@ struct BrowserTarget: Identifiable, Hashable {
     /// their `chrome://` URLs on the command line (verified on Arc), so we can
     /// deep-link the user straight there instead of describing where to click.
     var extensionsPage: String { "chrome://extensions" }
+
+    /// How to name this browser to `yt-dlp --cookies-from-browser`.
+    ///
+    /// yt-dlp knows brave, chrome, chromium, edge, firefox, opera, safari, vivaldi
+    /// and whale. Arc isn't on that list, but it's Chromium underneath, so point
+    /// yt-dlp at its profile directory with the `chrome:PATH` form instead.
+    var cookieSpec: String? {
+        switch id {
+        case "com.apple.Safari":            return "safari"
+        case "com.google.Chrome":           return "chrome"
+        case "com.brave.Browser":           return "brave"
+        case "com.microsoft.edgemac":       return "edge"
+        case "org.chromium.Chromium":       return "chromium"
+        case "com.vivaldi.Vivaldi":         return "vivaldi"
+        case "com.operasoftware.Opera":     return "opera"
+        case "company.thebrowser.Browser":
+            let path = NSHomeDirectory() + "/Library/Application Support/Arc/User Data"
+            return FileManager.default.fileExists(atPath: path) ? "chrome:\(path)" : nil
+        default: return nil
+        }
+    }
+
+    /// What granting this costs the user, so the UI can warn before they pick it.
+    /// Safari's cookie jar is protected by TCC; Chromium keeps its key in the
+    /// login keychain. Neither failure is self-explanatory when it happens.
+    var cookieCaveat: String? {
+        switch id {
+        case "com.apple.Safari":
+            return "Requires Full Disk Access for VideoPro."
+        case "company.thebrowser.Browser", "com.google.Chrome", "com.brave.Browser",
+             "com.microsoft.edgemac", "org.chromium.Chromium", "com.vivaldi.Vivaldi",
+             "com.operasoftware.Opera":
+            return "macOS will ask for keychain access the first time."
+        default: return nil
+        }
+    }
 }
 
 enum BrowserScan {
@@ -49,5 +85,20 @@ enum BrowserScan {
 
     static func safariInstalled() -> BrowserTarget? {
         installed().first { $0.kind == .safari }
+    }
+
+    /// Is this bundle id one of the browsers we can read a tab URL out of?
+    static func isKnownBrowser(_ bundleID: String) -> Bool {
+        known.contains { $0.id == bundleID }
+    }
+
+    /// Supported browsers with a live process, in display order.
+    ///
+    /// Deliberately not `installed()` — reading a tab out of a browser that isn't
+    /// running would launch it, which is a startling thing to happen when someone
+    /// presses a hotkey expecting a download.
+    static func runningBrowsers() -> [BrowserTarget] {
+        let live = Set(NSWorkspace.shared.runningApplications.compactMap(\.bundleIdentifier))
+        return installed().filter { live.contains($0.id) }
     }
 }

@@ -1,34 +1,112 @@
 import SwiftUI
 import AVKit
 import Combine
+import ImageIO
 
-// MARK: - Library sections
+// MARK: - Library scopes
 
-/// Sidebar sections. Filtering by state is the main thing a download manager has
-/// to do well once you have more than a handful of videos.
-enum LibrarySection: String, CaseIterable, Identifiable, Hashable {
-    case all         = "All Videos"
-    case downloading = "Downloading"
-    case completed   = "Completed"
-    case failed      = "Failed"
+/// What the sidebar selects.
+///
+/// These are *scopes* — genuinely different sets of videos. The old sidebar held
+/// All / Downloading / Completed / Failed, which were one list with a `where`
+/// clause on status; you saw all of it under All Videos anyway. Status is a
+/// transient property of an item, so it belongs in a filter, not in navigation.
+enum LibraryScope: Hashable, Identifiable {
+    case inbox
+    case all
+    case collection(UUID)
+    case smart(SmartFilter)
 
-    var id: String { rawValue }
+    var id: String {
+        switch self {
+        case .inbox: return "inbox"
+        case .all: return "all"
+        case .collection(let id): return "c-\(id.uuidString)"
+        case .smart(let f): return "s-\(f.rawValue)"
+        }
+    }
 
     var systemImage: String {
         switch self {
-        case .all:         return "square.stack"
-        case .downloading: return "arrow.down.circle"
-        case .completed:   return "checkmark.circle"
-        case .failed:      return "exclamationmark.triangle"
+        case .inbox: return "tray"
+        case .all: return "square.stack"
+        case .collection: return "folder"
+        case .smart(let f): return f.systemImage
         }
     }
 
     func matches(_ item: VideoItem) -> Bool {
         switch self {
-        case .all:         return true
+        case .inbox: return item.meta.tier == .inbox
+        case .all: return true
+        case .collection(let id): return item.meta.collectionIDs.contains(id)
+        case .smart(let f): return f.matches(item)
+        }
+    }
+}
+
+/// Saved filters for things the status chips can't express.
+enum SmartFilter: String, CaseIterable, Identifiable, Hashable {
+    case highRes = "High Resolution"
+    case long    = "Over 10 Minutes"
+    case kept    = "Kept"
+
+    var id: String { rawValue }
+
+    var systemImage: String {
+        switch self {
+        case .highRes: return "4k.tv"
+        case .long:    return "clock.arrow.circlepath"
+        case .kept:    return "pin"
+        }
+    }
+
+    func matches(_ item: VideoItem) -> Bool {
+        switch self {
+        case .highRes:
+            return max(item.meta.height, item.availableHeights.max() ?? 0) >= 1440
+        case .long:
+            return (item.meta.duration ?? 0) > 600
+        case .kept:
+            return item.meta.tier == .kept
+        }
+    }
+}
+
+/// Transient state, so: a filter, not a destination.
+enum StatusFilter: String, CaseIterable, Identifiable {
+    case all = "All"
+    case downloading = "Active"
+    case done = "Saved"
+    case failed = "Failed"
+
+    var id: String { rawValue }
+
+    func matches(_ item: VideoItem) -> Bool {
+        switch self {
+        case .all: return true
         case .downloading: return item.status == .downloading || item.status == .queued
-        case .completed:   return item.status == .done
-        case .failed:      return item.status == .error
+        case .done: return item.status == .done
+        case .failed: return item.status == .error
+        }
+    }
+}
+
+enum LibrarySort: String, CaseIterable, Identifiable {
+    case newest = "Newest"
+    case oldest = "Oldest"
+    case title = "Title"
+    case longest = "Longest"
+
+    var id: String { rawValue }
+
+    func apply(_ list: [VideoItem]) -> [VideoItem] {
+        switch self {
+        case .newest: return list.sorted { $0.meta.receivedAt > $1.meta.receivedAt }
+        case .oldest: return list.sorted { $0.meta.receivedAt < $1.meta.receivedAt }
+        case .title: return list.sorted {
+            $0.meta.title.localizedCaseInsensitiveCompare($1.meta.title) == .orderedAscending }
+        case .longest: return list.sorted { ($0.meta.duration ?? 0) > ($1.meta.duration ?? 0) }
         }
     }
 }
@@ -37,16 +115,16 @@ enum LibrarySection: String, CaseIterable, Identifiable, Hashable {
 
 struct ContentView: View {
     @EnvironmentObject var state: AppState
-    @State private var section: LibrarySection = .all
+    @State private var scope: LibraryScope = .inbox
     @AppStorage("vp.hasOnboarded") private var hasOnboarded = false
     @State private var showOnboarding = false
 
     var body: some View {
         NavigationSplitView {
-            SidebarView(selection: $section)
+            SidebarView(selection: $scope)
                 .navigationSplitViewColumnWidth(min: 188, ideal: 208, max: 260)
         } detail: {
-            LibraryView(section: section)
+            LibraryView(scope: scope)
         }
         .onAppear { if !hasOnboarded { showOnboarding = true } }
         .sheet(isPresented: $showOnboarding) {
@@ -60,34 +138,97 @@ struct ContentView: View {
 
 struct SidebarView: View {
     @EnvironmentObject var state: AppState
-    @Binding var selection: LibrarySection
+    @Binding var selection: LibraryScope
+    @State private var newCollectionName = ""
+    @State private var showNewCollection = false
+    @State private var renaming: VideoCollection?
 
     var body: some View {
         List(selection: $selection) {
             Section("Library") {
-                ForEach(LibrarySection.allCases) { s in
-                    Label(s.rawValue, systemImage: s.systemImage)
-                        .badge(count(s))
-                        .tag(s)
+                row(.inbox, "Inbox")
+                row(.all, "All Videos")
+            }
+
+            // Stays hidden until one exists — a new user should never meet an
+            // empty "Collections" header asking to be filled in.
+            if !state.collections.isEmpty {
+                Section("Collections") {
+                    ForEach(state.collections) { c in
+                        Label(c.name, systemImage: "folder")
+                            .badge(count(.collection(c.id)))
+                            .tag(LibraryScope.collection(c.id))
+                            .contextMenu {
+                                Button("Rename…") { renaming = c }
+                                Button("Delete Collection", role: .destructive) {
+                                    if selection == .collection(c.id) { selection = .inbox }
+                                    state.deleteCollection(c.id)
+                                }
+                            }
+                    }
+                }
+            }
+
+            Section("Smart") {
+                ForEach(SmartFilter.allCases) { f in
+                    row(.smart(f), f.rawValue)
                 }
             }
         }
         .listStyle(.sidebar)
-        // Status belongs down here, out of the toolbar — it's ambient, not an action.
-        .safeAreaInset(edge: .bottom) { statusFooter }
+        .safeAreaInset(edge: .bottom) { footer }
+        .popover(isPresented: $showNewCollection) { newCollectionForm }
+        .sheet(item: $renaming) { c in RenameSheet(collection: c).environmentObject(state) }
     }
 
-    private func count(_ s: LibrarySection) -> Int {
-        state.items.filter(s.matches).count
+    private func row(_ scope: LibraryScope, _ title: String) -> some View {
+        Label(title, systemImage: scope.systemImage)
+            .badge(count(scope))
+            .tag(scope)
     }
 
-    private var statusFooter: some View {
+    private func count(_ scope: LibraryScope) -> Int {
+        state.items.filter(scope.matches).count
+    }
+
+    private var newCollectionForm: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("New Collection").font(.subheadline).fontWeight(.semibold)
+            TextField("Name", text: $newCollectionName)
+                .textFieldStyle(.roundedBorder).frame(width: 200)
+                .onSubmit(commitNewCollection)
+            HStack {
+                Spacer()
+                Button("Create", action: commitNewCollection)
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(newCollectionName.trimmingCharacters(in: .whitespaces).isEmpty)
+            }
+        }
+        .padding(14)
+    }
+
+    private func commitNewCollection() {
+        let name = newCollectionName.trimmingCharacters(in: .whitespaces)
+        guard !name.isEmpty else { return }
+        let c = state.createCollection(named: name)
+        newCollectionName = ""
+        showNewCollection = false
+        selection = .collection(c.id)
+    }
+
+    private var footer: some View {
         VStack(alignment: .leading, spacing: 6) {
             Divider()
-            statusLine(ok: state.serverRunning,
-                       text: state.serverRunning ? "Listening" : "Inactive")
-            statusLine(ok: state.extensionStatus.connected,
-                       text: state.extensionStatus.connected ? "Extension connected" : "No extension")
+            Button {
+                showNewCollection = true
+            } label: {
+                Label("New Collection", systemImage: "plus").font(.caption)
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(.secondary)
+
+            statusLine(ok: state.toolsReady,
+                       text: state.toolsReady ? "Ready" : "yt-dlp missing")
         }
         .padding(.horizontal, 12)
         .padding(.bottom, 10)
@@ -96,13 +237,37 @@ struct SidebarView: View {
     private func statusLine(ok: Bool, text: String) -> some View {
         HStack(spacing: 6) {
             Circle()
-                .fill(ok ? Color.green : Color.secondary.opacity(0.45))
+                .fill(ok ? Color.green : Color.orange)
                 .frame(width: 6, height: 6)
-            Text(text)
-                .font(.caption2)
-                .foregroundStyle(.secondary)
-                .lineLimit(1)
+            Text(text).font(.caption2).foregroundStyle(.secondary).lineLimit(1)
         }
+    }
+}
+
+struct RenameSheet: View {
+    @EnvironmentObject var state: AppState
+    let collection: VideoCollection
+    @Environment(\.dismiss) private var dismiss
+    @State private var name = ""
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Rename Collection").font(.headline)
+            TextField("Name", text: $name).textFieldStyle(.roundedBorder).frame(width: 240)
+            HStack {
+                Spacer()
+                Button("Cancel") { dismiss() }
+                Button("Rename") {
+                    state.renameCollection(collection.id, to: name)
+                    dismiss()
+                }
+                .buttonStyle(.borderedProminent)
+                .keyboardShortcut(.defaultAction)
+                .disabled(name.trimmingCharacters(in: .whitespaces).isEmpty)
+            }
+        }
+        .padding(18)
+        .onAppear { name = collection.name }
     }
 }
 
@@ -110,29 +275,47 @@ struct SidebarView: View {
 
 struct LibraryView: View {
     @EnvironmentObject var state: AppState
-    let section: LibrarySection
+    let scope: LibraryScope
 
     @State private var playerItem: PlayerContext?
     @State private var convertItem: VideoItem?
     @State private var showSettings = false
     @State private var showAddURL = false
+    @State private var showActivity = false
     @State private var urlText = ""
+    @State private var search = ""
+    @State private var status: StatusFilter = .all
+    @State private var sort: LibrarySort = .newest
 
-    private var items: [VideoItem] { state.items.filter(section.matches) }
+    /// Everything in this scope, before the status chips and search narrow it —
+    /// used so the chips can show counts and hide themselves when irrelevant.
+    private var scoped: [VideoItem] { state.items.filter(scope.matches) }
+
+    private var visible: [VideoItem] {
+        var list = scoped.filter(status.matches)
+        let q = search.trimmingCharacters(in: .whitespaces).lowercased()
+        if !q.isEmpty {
+            list = list.filter {
+                $0.meta.title.lowercased().contains(q)
+                    || (URL(string: $0.meta.downloadURL)?.host?.lowercased().contains(q) ?? false)
+                    || $0.meta.tags.contains { $0.lowercased().contains(q) }
+            }
+        }
+        return sort.apply(list)
+    }
 
     var body: some View {
         Group {
             if state.items.isEmpty {
-                ZStack { BackdropView(); EmptyStateView() }
-            } else if items.isEmpty {
-                ContentUnavailableView(
-                    "Nothing \(section.rawValue.lowercased())",
-                    systemImage: section.systemImage,
-                    description: Text("Videos will show up here as they change state.")
-                )
+                EmptyStateView()
+            } else if scoped.isEmpty {
+                ContentUnavailableView("Nothing here yet", systemImage: scope.systemImage,
+                                       description: Text(emptyScopeHint))
+            } else if visible.isEmpty {
+                ContentUnavailableView.search(text: search)
             } else {
                 List {
-                    ForEach(items) { item in
+                    ForEach(visible) { item in
                         VideoRow(item: item,
                                  onPlay: { play(item) },
                                  onExport: { convertItem = item })
@@ -144,46 +327,109 @@ struct LibraryView: View {
                 .alternatingRowBackgrounds()
             }
         }
-        .navigationTitle(section.rawValue)
+        .safeAreaInset(edge: .top) { if !state.items.isEmpty { filterBar } }
+        .navigationTitle(title)
         .navigationSubtitle(subtitle)
+        .searchable(text: $search, placement: .toolbar, prompt: "Search videos")
         .toolbar { toolbarContent }
         .sheet(item: $playerItem) { PlayerSheet(context: $0) }
         .sheet(item: $convertItem) { ConvertSheet(item: $0).environmentObject(state) }
     }
 
-    private var subtitle: String {
-        let n = items.count
-        let base = "\(n) video\(n == 1 ? "" : "s")"
-        if state.activeDownloads + state.queuedCount > 0 {
-            return base + " · \(state.activeDownloads) downloading"
-                + (state.queuedCount > 0 ? ", \(state.queuedCount) queued" : "")
+    private var title: String {
+        switch scope {
+        case .inbox: return "Inbox"
+        case .all: return "All Videos"
+        case .collection(let id):
+            return state.collections.first { $0.id == id }?.name ?? "Collection"
+        case .smart(let f): return f.rawValue
         }
+    }
+
+    private var emptyScopeHint: String {
+        switch scope {
+        case .inbox: return "New videos land here. They clear themselves after \(state.inboxExpiryDays) days — your files are never touched."
+        case .collection: return "Drop videos in from the library, or use Add to Collection."
+        default: return "Videos will show up here as they qualify."
+        }
+    }
+
+    private var subtitle: String {
+        let n = visible.count
+        var base = "\(n) video\(n == 1 ? "" : "s")"
+        if n != scoped.count { base += " of \(scoped.count)" }
         return base
+    }
+
+    /// Status as chips. One click, no navigation, and they disappear entirely
+    /// when the current scope has nothing in flight.
+    @ViewBuilder private var filterBar: some View {
+        let counts = Dictionary(grouping: scoped, by: { item -> StatusFilter in
+            if item.status == .downloading || item.status == .queued { return .downloading }
+            if item.status == .done { return .done }
+            if item.status == .error { return .failed }
+            return .all
+        }).mapValues(\.count)
+
+        HStack(spacing: 6) {
+            ForEach(StatusFilter.allCases) { f in
+                let n = f == .all ? scoped.count : (counts[f] ?? 0)
+                if f == .all || n > 0 {
+                    Button {
+                        status = (status == f && f != .all) ? .all : f
+                    } label: {
+                        Text(n > 0 && f != .all ? "\(f.rawValue) \(n)" : f.rawValue)
+                            .font(.caption)
+                            .padding(.horizontal, 9).padding(.vertical, 3)
+                    }
+                    .buttonStyle(.plain)
+                    .background(status == f ? Color.accentColor.opacity(0.18) : Color.secondary.opacity(0.10),
+                                in: .capsule)
+                    .foregroundStyle(status == f ? Color.accentColor : .secondary)
+                }
+            }
+            Spacer()
+            Picker("", selection: $sort) {
+                ForEach(LibrarySort.allCases) { Text($0.rawValue).tag($0) }
+            }
+            .labelsHidden().pickerStyle(.menu).controlSize(.small).frame(width: 110)
+        }
+        .padding(.horizontal, 12).padding(.vertical, 6)
+        .background(.bar)
     }
 
     @ToolbarContentBuilder
     private var toolbarContent: some ToolbarContent {
         ToolbarItemGroup(placement: .primaryAction) {
-            if state.activeDownloads + state.queuedCount > 0 {
-                ProgressView().controlSize(.small)
-            }
             Button { showAddURL.toggle() } label: { Image(systemName: "plus") }
                 .help("Add a video by URL")
                 .popover(isPresented: $showAddURL, arrowEdge: .bottom) { addURLPopover }
 
-            if state.items.contains(where: { $0.status == .idle || $0.status == .error }) {
-                Button { state.downloadAll() } label: { Image(systemName: "arrow.down.circle") }
-                    .help("Download all")
+            // In-flight work lives here now instead of taking two sidebar rows.
+            if state.activeDownloads + state.queuedCount > 0 {
+                Button { showActivity.toggle() } label: {
+                    Image(systemName: "arrow.down.circle")
+                        .symbolVariant(.fill)
+                        .foregroundStyle(.tint)
+                }
+                .help("Activity")
+                .popover(isPresented: $showActivity, arrowEdge: .bottom) {
+                    ActivityPopover().environmentObject(state)
+                }
             }
+
+            if scoped.contains(where: { $0.status == .idle || $0.status == .error }) {
+                Button { for i in visible where i.status == .idle || i.status == .error {
+                    state.download(i)
+                } } label: { Image(systemName: "arrow.down.to.line") }
+                    .help("Download everything shown")
+            }
+
             Button { showSettings.toggle() } label: { Image(systemName: "slider.horizontal.3") }
                 .help("Settings")
                 .popover(isPresented: $showSettings, arrowEdge: .bottom) {
                     SettingsPopover().environmentObject(state)
                 }
-            if !state.items.isEmpty {
-                Button(role: .destructive) { state.clear() } label: { Image(systemName: "trash") }
-                    .help("Clear all")
-            }
         }
     }
 
@@ -214,12 +460,10 @@ struct LibraryView: View {
     }
 
     private func play(_ item: VideoItem) {
-        // Warmed on arrival (or already downloaded) — open with zero latency.
         if let url = item.warmPlayURL {
             playerItem = PlayerContext(url: url, title: item.meta.title)
             return
         }
-        // Cold: never warmed, or the signed URL aged out. Resolve and re-cache.
         item.statusLine = "Resolving stream…"
         Task {
             if let url = await DownloadManager.shared.resolvePlayableURL(for: item.meta) {
@@ -230,6 +474,48 @@ struct LibraryView: View {
                 item.statusLine = "Couldn't resolve a playable stream"
             }
         }
+    }
+}
+
+/// What's running right now. Replaces the Downloading/Failed sidebar rows.
+struct ActivityPopover: View {
+    @EnvironmentObject var state: AppState
+
+    private var active: [VideoItem] {
+        state.items.filter { $0.status == .downloading || $0.status == .queued }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Text("Activity").font(.subheadline).fontWeight(.semibold)
+                Spacer()
+                Text("\(state.activeDownloads) of \(state.maxConcurrent)")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            if active.isEmpty {
+                Text("Nothing in progress.").font(.caption).foregroundStyle(.secondary)
+            }
+            ForEach(active) { item in
+                VStack(alignment: .leading, spacing: 3) {
+                    HStack {
+                        Text(item.meta.title).font(.caption).lineLimit(1)
+                        Spacer()
+                        Button {
+                            state.cancel(item)
+                        } label: { Image(systemName: "xmark.circle.fill") }
+                            .buttonStyle(.plain).foregroundStyle(.secondary)
+                    }
+                    if item.status == .queued {
+                        Text("Queued").font(.caption2).foregroundStyle(.tertiary)
+                    } else {
+                        ProgressView(value: item.progress).progressViewStyle(.linear)
+                    }
+                }
+            }
+        }
+        .padding(14)
+        .frame(width: 300)
     }
 }
 
@@ -340,6 +626,28 @@ struct VideoRow: View {
         Button("Copy Source URL") {
             NSPasteboard.general.clearContents()
             NSPasteboard.general.setString(item.meta.downloadURL, forType: .string)
+        }
+        Divider()
+        if item.meta.tier == .inbox {
+            Button("Keep in Library") { state.promote(item) }
+        }
+        Menu("Add to Collection") {
+            ForEach(state.collections) { c in
+                Button(c.name) { state.add(item, to: c.id) }
+                    .disabled(item.meta.collectionIDs.contains(c.id))
+            }
+            if !state.collections.isEmpty { Divider() }
+            Button("New Collection…") {
+                let c = state.createCollection(named: "Untitled Collection")
+                state.add(item, to: c.id)
+            }
+        }
+        if !item.meta.collectionIDs.isEmpty {
+            Menu("Remove from Collection") {
+                ForEach(state.collections.filter { item.meta.collectionIDs.contains($0.id) }) { c in
+                    Button(c.name) { state.remove(item, from: c.id) }
+                }
+            }
         }
         Divider()
         Button("Remove", role: .destructive) { state.remove(item) }
@@ -531,6 +839,10 @@ struct SettingsPopover: View {
 
             Divider()
 
+            FastPathSettings()
+
+            Divider()
+
             ExtensionSetupView()
 
             Divider()
@@ -557,6 +869,43 @@ struct SettingsPopover: View {
         }
         .padding(16)
         .frame(width: 320)
+    }
+}
+
+// MARK: - Fast path settings
+
+/// The grab-a-video-without-the-window controls: global hotkey and cookie source.
+struct FastPathSettings: View {
+    @EnvironmentObject var state: AppState
+    @State private var browsers: [BrowserTarget] = []
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Quick grab").font(.caption).foregroundStyle(.secondary)
+
+            Toggle(isOn: $state.hotKeyEnabled) {
+                Label("Global shortcut (\(GlobalHotKey.displayName))", systemImage: "keyboard")
+            }
+            Text("Grabs the video from whichever browser you were last in.")
+                .font(.system(size: 10)).foregroundStyle(.secondary)
+
+            Picker("Sign-in cookies", selection: $state.cookieBrowserID) {
+                Text("Don’t use cookies").tag(String?.none)
+                ForEach(browsers) { b in
+                    Text(b.name).tag(String?.some(b.id))
+                }
+            }
+            .pickerStyle(.menu)
+            .controlSize(.small)
+
+            // Say what it buys and what it costs, before they pick — both failure
+            // modes here are opaque if you meet them cold.
+            Text(state.cookieBrowser.flatMap(\.cookieCaveat)
+                 ?? "Needed for private, members-only, or age-restricted videos.")
+                .font(.system(size: 10)).foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .onAppear { browsers = BrowserScan.installed().filter { $0.cookieSpec != nil } }
     }
 }
 
@@ -1004,16 +1353,61 @@ struct ThumbView: View {
     static func localImage(_ s: String) -> NSImage? {
         if s.hasPrefix("data:"), let comma = s.firstIndex(of: ",") {
             let b64 = String(s[s.index(after: comma)...])
-            guard let data = Data(base64Encoded: b64) else { return nil }
-            return NSImage(data: data)
+            // Tolerate whitespace/newlines that survive a JSON round-trip; strict
+            // decoding would return nil and silently drop an otherwise fine frame.
+            guard let data = Data(base64Encoded: b64, options: .ignoreUnknownCharacters)
+            else { return nil }
+            return decode(data)
         }
         if s.hasPrefix("/") {
-            return NSImage(contentsOfFile: s)
+            guard let data = FileManager.default.contents(atPath: s) else { return nil }
+            return decode(data)
         }
-        if s.hasPrefix("file://"), let url = URL(string: s) {
-            return NSImage(contentsOf: url)
+        if s.hasPrefix("file://"), let url = URL(string: s), let data = try? Data(contentsOf: url) {
+            return decode(data)
         }
         return nil
+    }
+
+    /// Decode **only** if the payload is a whole image.
+    ///
+    /// `NSImage(data:)` is happy to return an object for a half-written JPEG: it
+    /// decodes the scanlines it got and leaves the rest grey, which renders as a
+    /// thin coloured bar across the top of the thumbnail. Because that object is
+    /// non-nil, the caller takes the "we have an image" branch and the placeholder
+    /// never gets a chance to show.
+    ///
+    /// ImageIO is no help here — `CGImageSourceCreateWithData` treats its buffer as
+    /// final, so it reports `.statusComplete` for a truncated JPEG just as readily
+    /// as for an intact one (measured, not assumed). What *does* separate them is
+    /// the container's terminator, so check that structurally.
+    static func decode(_ data: Data) -> NSImage? {
+        guard isComplete(data),
+              let src = CGImageSourceCreateWithData(data as CFData, nil),
+              CGImageSourceGetCount(src) > 0,
+              let cg = CGImageSourceCreateImageAtIndex(src, 0, nil),
+              cg.width > 0, cg.height > 0
+        else { return nil }
+        return NSImage(cgImage: cg, size: NSSize(width: cg.width, height: cg.height))
+    }
+
+    /// Does this buffer actually end where its format says it should?
+    ///
+    /// Covers the two formats we ever hold: JPEG from the extension's canvas grab
+    /// and from ffmpeg's frame export, and PNG defensively. Anything else is
+    /// passed through to the decoder rather than rejected on a guess.
+    private static func isComplete(_ data: Data) -> Bool {
+        guard data.count > 4 else { return false }
+        let head = [UInt8](data.prefix(4))
+        if head[0] == 0xFF, head[1] == 0xD8, head[2] == 0xFF {
+            // JPEG: a bare FFD9 is the end-of-image marker. It can't occur inside
+            // entropy-coded data, where a literal FF is byte-stuffed as FF00.
+            return data.range(of: Data([0xFF, 0xD9]), options: .backwards) != nil
+        }
+        if head == [0x89, 0x50, 0x4E, 0x47] {
+            return data.range(of: Data("IEND".utf8), options: .backwards) != nil
+        }
+        return true
     }
 }
 

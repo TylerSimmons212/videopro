@@ -21,10 +21,24 @@ final class AppState: ObservableObject {
     /// Persisted so we can distinguish "never set up" from "set up, not open right now".
     @Published var everConnected = false
 
-    // User download preferences.
-    @Published var defaultQuality: DownloadQuality = .bestMP4
-    @Published var embedThumbnail = true
-    @Published var embedSubtitles = true
+    // User download preferences. All persisted — these used to reset to their
+    // defaults on every launch, silently undoing whatever the user chose.
+    @Published var defaultQuality: DownloadQuality = .bestMP4 { didSet { persistPrefs() } }
+    @Published var embedThumbnail = true { didSet { persistPrefs() } }
+    @Published var embedSubtitles = true { didSet { persistPrefs() } }
+
+    /// Bundle id of the browser to borrow cookies from, or nil for none.
+    ///
+    /// Off by default and deliberately opt-in: it's what makes logged-in and
+    /// members-only videos work without the extension, but the first use triggers
+    /// a keychain prompt (Chromium) or needs Full Disk Access (Safari), and
+    /// neither is something to spring on someone who didn't ask.
+    @Published var cookieBrowserID: String? {
+        didSet { persistPrefs(); applyCookieSetting() }
+    }
+
+    /// System-wide hotkey for the fast path.
+    @Published var hotKeyEnabled = true { didSet { persistPrefs(); applyHotKey() } }
 
     // Download queue
     @Published var activeDownloads = 0
@@ -60,6 +74,72 @@ final class AppState: ObservableObject {
             self.downloadFolder = saved
         }
         self.everConnected = UserDefaults.standard.bool(forKey: "everConnected")
+        loadPrefs()
+
+        // Throttled so a burst of transitions coalesces into one re-render.
+        VideoItem.statusChanged
+            .throttle(for: .milliseconds(200), scheduler: RunLoop.main, latest: true)
+            .sink { [weak self] in self?.objectWillChange.send() }
+            .store(in: &bag)
+    }
+
+    private var bag = Set<AnyCancellable>()
+
+    // MARK: - Preferences
+
+    private enum PrefKey {
+        static let quality = "defaultQuality"
+        static let thumb = "embedThumbnail"
+        static let subs = "embedSubtitles"
+        static let cookieBrowser = "cookieBrowserID"
+        static let hotKey = "hotKeyEnabled"
+    }
+
+    private var loadingPrefs = false
+
+    private func loadPrefs() {
+        loadingPrefs = true
+        defer { loadingPrefs = false }
+        let d = UserDefaults.standard
+        if let raw = d.string(forKey: PrefKey.quality),
+           let q = DownloadQuality(rawValue: raw) { defaultQuality = q }
+        if d.object(forKey: PrefKey.thumb) != nil { embedThumbnail = d.bool(forKey: PrefKey.thumb) }
+        if d.object(forKey: PrefKey.subs) != nil { embedSubtitles = d.bool(forKey: PrefKey.subs) }
+        cookieBrowserID = d.string(forKey: PrefKey.cookieBrowser)
+        if d.object(forKey: PrefKey.hotKey) != nil { hotKeyEnabled = d.bool(forKey: PrefKey.hotKey) }
+        if d.object(forKey: "inboxExpiryDays") != nil {
+            inboxExpiryDays = d.integer(forKey: "inboxExpiryDays")
+        }
+    }
+
+    private func persistPrefs() {
+        guard !loadingPrefs else { return }   // don't echo the load straight back
+        let d = UserDefaults.standard
+        d.set(defaultQuality.rawValue, forKey: PrefKey.quality)
+        d.set(embedThumbnail, forKey: PrefKey.thumb)
+        d.set(embedSubtitles, forKey: PrefKey.subs)
+        d.set(cookieBrowserID, forKey: PrefKey.cookieBrowser)
+        d.set(hotKeyEnabled, forKey: PrefKey.hotKey)
+    }
+
+    /// The browser cookies are currently being borrowed from, if any.
+    var cookieBrowser: BrowserTarget? {
+        guard let id = cookieBrowserID else { return nil }
+        return BrowserScan.installed().first { $0.id == id }
+    }
+
+    private func applyCookieSetting() {
+        DownloadManager.shared.cookieSpec = cookieBrowser?.cookieSpec
+    }
+
+    private func applyHotKey() {
+        if hotKeyEnabled {
+            GlobalHotKey.shared.register { [weak self] in
+                Task { @MainActor in self?.grabFrontTab() }
+            }
+        } else {
+            GlobalHotKey.shared.unregister()
+        }
     }
 
     // MARK: - Lifecycle
@@ -67,10 +147,14 @@ final class AppState: ObservableObject {
     func start() {
         clearOwnQuarantineIfNeeded()
         checkInstallLocation()
+        loadCollections()
         loadLibrary()
+        expireInbox()
         refreshTools()
         requestNotifications()
         startServer()
+        applyCookieSetting()
+        applyHotKey()
 
         // Only now is it safe to apply incoming URLs: loadLibrary() replaces
         // `items` wholesale, so anything added before this point would be lost.
@@ -300,32 +384,184 @@ final class AppState: ObservableObject {
         saveLibrary()
     }
 
+    // MARK: - Fast path
+
+    /// Grab whatever is in the user's browser and start downloading it.
+    ///
+    /// This is the whole point of the app-first rework: hotkey or menu bar item →
+    /// the video is downloading. No window, no paste, no extension. Everything
+    /// this needs is a page URL, which is all yt-dlp ever wanted.
+    func grabFrontTab() {
+        do {
+            let tab = try FrontTab.shared.read()
+            guard let item = addURL(tab.url, title: tab.title) else {
+                notify("Already in your library", tab.title ?? tab.url)
+                return
+            }
+            download(item)
+        } catch let error as FrontTab.Failure {
+            if error.isPermission {
+                // No API can re-prompt once Automation has been denied, so an
+                // alert that routes to Settings is the only way back.
+                let a = NSAlert()
+                a.messageText = error.errorDescription ?? "Permission needed"
+                a.informativeText = "Turn VideoPro on under Privacy & Security → Automation, then try again."
+                a.addButton(withTitle: "Open Settings")
+                a.addButton(withTitle: "Cancel")
+                if a.runModal() == .alertFirstButtonReturn { FrontTab.openAutomationSettings() }
+            } else {
+                notify("Couldn’t grab the tab", error.errorDescription ?? "Unknown error")
+            }
+        } catch {
+            notify("Couldn’t grab the tab", error.localizedDescription)
+        }
+    }
+
+    private func notify(_ title: String, _ body: String) {
+        let content = UNMutableNotificationContent()
+        content.title = title
+        content.body = body
+        let req = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
+        UNUserNotificationCenter.current().add(req)
+    }
+
     /// Add a video by pasting a URL directly into the app (no extension needed).
-    func addURL(_ raw: String) {
+    @discardableResult
+    func addURL(_ raw: String, title: String? = nil) -> VideoItem? {
         var s = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !s.isEmpty else { return }
+        guard !s.isEmpty else { return nil }
         if !s.lowercased().hasPrefix("http") { s = "https://" + s }
         guard let url = URL(string: s), let host = url.host, !host.isEmpty else {
             alert("Invalid URL", "That doesn’t look like a web address.")
-            return
+            return nil
         }
-        if items.contains(where: { $0.meta.downloadURL == s }) { return }
-        let meta = VideoMeta(title: host, pageURL: s, mediaURL: "", sourceKind: "page",
+        if items.contains(where: { $0.meta.downloadURL == s }) { return nil }
+        // The browser's tab title beats the bare host as a placeholder — enrichment
+        // will replace it with the real one shortly either way.
+        let meta = VideoMeta(title: title ?? host, pageURL: s, mediaURL: "", sourceKind: "page",
                              thumbnail: "", duration: nil, width: 0, height: 0, platform: nil)
         let item = VideoItem(meta)
         items.insert(item, at: 0)
         enrich(item)
         saveLibrary()
+        return item
     }
 
     func remove(_ item: VideoItem) {
         items.removeAll { $0.id == item.id }
+        for idx in collections.indices {
+            collections[idx].ordering.removeAll { $0 == item.id }
+        }
+        // The generated preview frame outlives the entry otherwise; nothing else
+        // ever prunes that directory.
+        let thumb = DownloadManager.thumbsDirectory()
+            .appendingPathComponent("\(item.id.uuidString).jpg")
+        try? FileManager.default.removeItem(at: thumb)
         saveLibrary()
+        saveCollections()
     }
 
     func clear() {
-        items.removeAll()
+        for item in items { remove(item) }
+    }
+
+    // MARK: - Tiers & collections
+
+    @Published var collections: [VideoCollection] = []
+
+    /// How long an untouched Inbox entry survives.
+    @Published var inboxExpiryDays = 14 { didSet { UserDefaults.standard.set(inboxExpiryDays, forKey: "inboxExpiryDays") } }
+
+    /// Mark an item as deliberately kept.
+    ///
+    /// Called wherever the user does something that implies intent rather than
+    /// asking them to curate explicitly — that's the whole point of the tier
+    /// split. Downloading is *not* one of those actions: grabbing one video and
+    /// downloading it is exactly the one-off case that should still tidy itself up.
+    func promote(_ item: VideoItem) {
+        guard item.meta.tier != .kept else { return }
+        item.meta.tier = .kept
         saveLibrary()
+    }
+
+    /// Drop stale Inbox entries. **Files on disk are never touched** — this only
+    /// forgets the library row, so a one-off grab leaves nothing to clean up.
+    private func expireInbox() {
+        let cutoff = Date().addingTimeInterval(-Double(inboxExpiryDays) * 86_400)
+        let stale = items.filter {
+            $0.meta.tier == .inbox && $0.meta.receivedAt < cutoff
+                && $0.status != .downloading && $0.status != .queued
+        }
+        guard !stale.isEmpty else { return }
+        let ids = Set(stale.map(\.id))
+        items.removeAll { ids.contains($0.id) }
+        for item in stale {
+            let thumb = DownloadManager.thumbsDirectory()
+                .appendingPathComponent("\(item.id.uuidString).jpg")
+            try? FileManager.default.removeItem(at: thumb)
+        }
+        saveLibrary()
+    }
+
+    @discardableResult
+    func createCollection(named name: String) -> VideoCollection {
+        let c = VideoCollection(name: name)
+        collections.append(c)
+        saveCollections()
+        return c
+    }
+
+    func renameCollection(_ id: UUID, to name: String) {
+        guard let idx = collections.firstIndex(where: { $0.id == id }) else { return }
+        collections[idx].name = name
+        saveCollections()
+    }
+
+    /// Removes the grouping, not the videos — they stay in the library.
+    func deleteCollection(_ id: UUID) {
+        collections.removeAll { $0.id == id }
+        for item in items where item.meta.collectionIDs.contains(id) {
+            item.meta.collectionIDs.removeAll { $0 == id }
+        }
+        saveCollections()
+        saveLibrary()
+    }
+
+    func add(_ item: VideoItem, to collectionID: UUID) {
+        guard let idx = collections.firstIndex(where: { $0.id == collectionID }) else { return }
+        if !collections[idx].ordering.contains(item.id) {
+            collections[idx].ordering.append(item.id)
+        }
+        if !item.meta.collectionIDs.contains(collectionID) {
+            item.meta.collectionIDs.append(collectionID)
+        }
+        promote(item)   // filing something away is intent
+        saveCollections()
+        saveLibrary()
+    }
+
+    func remove(_ item: VideoItem, from collectionID: UUID) {
+        guard let idx = collections.firstIndex(where: { $0.id == collectionID }) else { return }
+        collections[idx].ordering.removeAll { $0 == item.id }
+        item.meta.collectionIDs.removeAll { $0 == collectionID }
+        saveCollections()
+        saveLibrary()
+    }
+
+    private var collectionsURL: URL {
+        libraryURL.deletingLastPathComponent().appendingPathComponent("collections.json")
+    }
+
+    private func saveCollections() {
+        if let data = try? JSONEncoder().encode(collections) {
+            try? data.write(to: collectionsURL, options: .atomic)
+        }
+    }
+
+    private func loadCollections() {
+        guard let data = try? Data(contentsOf: collectionsURL),
+              let list = try? JSONDecoder().decode([VideoCollection].self, from: data) else { return }
+        collections = list
     }
 
     // MARK: - Downloads
@@ -420,9 +656,19 @@ final class AppState: ObservableObject {
 
         Task {
             if let info = await DownloadManager.shared.fetchInfo(for: item.meta) {
-                // Prefer a real captured frame (data:) from the extension; otherwise
-                // use yt-dlp's thumbnail URL and persist it so we don't refetch.
-                if let thumb = info.thumbnail, !thumb.isEmpty, !item.thumbnail.hasPrefix("data:") {
+                // Take yt-dlp's thumbnail whenever it has one, and persist it so we
+                // don't refetch.
+                //
+                // This used to keep the extension's captured `data:` frame instead.
+                // That frame is grabbed off a <canvas> the moment a <video> reports
+                // readyState >= 2, so it is routinely a partly-painted image — which
+                // renders as a thin bar — and once stored it was never revisited:
+                // this branch skipped it, and hasDisplayableThumbnail() counted any
+                // `data:` string as good, so the ffmpeg fallback below never ran
+                // either. A bad capture was permanent. yt-dlp's thumbnail is also
+                // full-resolution rather than the 160px canvas grab, so preferring it
+                // is the better picture regardless.
+                if let thumb = info.thumbnail, !thumb.isEmpty {
                     item.thumbnail = thumb
                     item.meta.thumbnail = thumb
                     saveLibrary()
@@ -458,9 +704,13 @@ final class AppState: ObservableObject {
 
     private static func hasDisplayableThumbnail(_ thumb: String) -> Bool {
         if thumb.isEmpty { return false }
-        if thumb.hasPrefix("data:") || thumb.hasPrefix("http") { return true }
-        // Local file path — only if it still exists.
-        return FileManager.default.fileExists(atPath: thumb)
+        // An http URL is taken on trust — AsyncImage resolves it later.
+        if thumb.hasPrefix("http") { return true }
+        // Everything else we can actually decode right now, so do: a `data:` frame
+        // the extension truncated, or an ffmpeg JPEG that got cut off, both decode
+        // to a partial image. Treat those as missing so the ffmpeg fallback below
+        // gets a chance to replace them.
+        return ThumbView.localImage(thumb) != nil
     }
 
     /// Back-compat alias used by the download menu.
@@ -757,7 +1007,12 @@ final class AppState: ObservableObject {
         return base.appendingPathComponent("library.json")
     }
 
+    /// Set when the library file exists but wouldn't parse. Blocks every write
+    /// from that point on — see loadLibrary() for why that matters.
+    private var libraryLoadFailed = false
+
     private func saveLibrary() {
+        guard !libraryLoadFailed else { return }
         let metas = items.map(\.meta)
         if let data = try? JSONEncoder().encode(metas) {
             try? data.write(to: libraryURL, options: .atomic)
@@ -765,8 +1020,25 @@ final class AppState: ObservableObject {
     }
 
     private func loadLibrary() {
-        guard let data = try? Data(contentsOf: libraryURL),
-              let metas = try? JSONDecoder().decode([VideoMeta].self, from: data) else { return }
+        guard let data = try? Data(contentsOf: libraryURL) else { return }
+        let metas: [VideoMeta]
+        do {
+            metas = try JSONDecoder().decode([VideoMeta].self, from: data)
+        } catch {
+            // A decode failure used to be indistinguishable from an empty library:
+            // `items` stayed empty and the very next saveLibrary() overwrote the
+            // file with `[]`, destroying it. Any schema change makes that a live
+            // risk, so keep a copy and refuse to write until it's sorted out.
+            let backup = libraryURL.deletingLastPathComponent()
+                .appendingPathComponent("library.unreadable-\(Int(Date().timeIntervalSince1970)).json")
+            try? FileManager.default.copyItem(at: libraryURL, to: backup)
+            libraryLoadFailed = true
+            NSLog("VideoPro: could not read library (%@). Backed up to %@; writes disabled.",
+                  error.localizedDescription, backup.path)
+            alert("Couldn’t open your library",
+                  "VideoPro couldn’t read its library file, so it won’t overwrite it. A copy is at:\n\n\(backup.path)")
+            return
+        }
         items = metas.map { VideoItem($0) }
         for item in items {
             // Restore "downloaded" state if the file is still on disk. markDone
