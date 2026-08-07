@@ -40,6 +40,14 @@ final class AppState: ObservableObject {
     /// System-wide hotkey for the fast path.
     @Published var hotKeyEnabled = true { didSet { persistPrefs(); applyHotKey() } }
 
+    /// The combination the fast path listens for. User-changeable, because the
+    /// default can collide with whatever else they've installed.
+    @Published var hotKeyCombo: KeyCombo = .fallback { didSet { persistPrefs(); applyHotKey() } }
+
+    /// Set when the OS refused the chosen combination — another app already owns
+    /// it. Surfaced in Settings; without it a taken shortcut just looks broken.
+    @Published var hotKeyUnavailable = false
+
     // Download queue
     @Published var activeDownloads = 0
     @Published var queuedCount = 0
@@ -93,6 +101,8 @@ final class AppState: ObservableObject {
         static let subs = "embedSubtitles"
         static let cookieBrowser = "cookieBrowserID"
         static let hotKey = "hotKeyEnabled"
+        static let hotKeyCode = "hotKeyCode"
+        static let hotKeyModifiers = "hotKeyModifiers"
     }
 
     private var loadingPrefs = false
@@ -107,6 +117,11 @@ final class AppState: ObservableObject {
         if d.object(forKey: PrefKey.subs) != nil { embedSubtitles = d.bool(forKey: PrefKey.subs) }
         cookieBrowserID = d.string(forKey: PrefKey.cookieBrowser)
         if d.object(forKey: PrefKey.hotKey) != nil { hotKeyEnabled = d.bool(forKey: PrefKey.hotKey) }
+        if d.object(forKey: PrefKey.hotKeyCode) != nil,
+           d.object(forKey: PrefKey.hotKeyModifiers) != nil {
+            hotKeyCombo = KeyCombo(keyCode: UInt32(d.integer(forKey: PrefKey.hotKeyCode)),
+                                   modifiers: UInt32(d.integer(forKey: PrefKey.hotKeyModifiers)))
+        }
         if d.object(forKey: "inboxExpiryDays") != nil {
             inboxExpiryDays = d.integer(forKey: "inboxExpiryDays")
         }
@@ -120,6 +135,8 @@ final class AppState: ObservableObject {
         d.set(embedSubtitles, forKey: PrefKey.subs)
         d.set(cookieBrowserID, forKey: PrefKey.cookieBrowser)
         d.set(hotKeyEnabled, forKey: PrefKey.hotKey)
+        d.set(Int(hotKeyCombo.keyCode), forKey: PrefKey.hotKeyCode)
+        d.set(Int(hotKeyCombo.modifiers), forKey: PrefKey.hotKeyModifiers)
     }
 
     /// The browser cookies are currently being borrowed from, if any.
@@ -134,11 +151,13 @@ final class AppState: ObservableObject {
 
     private func applyHotKey() {
         if hotKeyEnabled {
-            GlobalHotKey.shared.register { [weak self] in
+            let ok = GlobalHotKey.shared.register(hotKeyCombo) { [weak self] in
                 Task { @MainActor in self?.grabFrontTab() }
             }
+            hotKeyUnavailable = !ok
         } else {
             GlobalHotKey.shared.unregister()
+            hotKeyUnavailable = false
         }
     }
 
