@@ -461,8 +461,30 @@ final class AppState: ObservableObject {
         saveCollections()
     }
 
+    /// Batch remove.
+    ///
+    /// Not a loop over `remove(_:)` on purpose: that writes the library and the
+    /// collections file once per item, so removing a selection of thirty would
+    /// mean sixty disk writes and thirty `items` mutations for the list to
+    /// animate through.
+    func remove(_ batch: [VideoItem]) {
+        guard !batch.isEmpty else { return }
+        let ids = Set(batch.map(\.id))
+        items.removeAll { ids.contains($0.id) }
+        for idx in collections.indices {
+            collections[idx].ordering.removeAll { ids.contains($0) }
+        }
+        for id in ids {
+            let thumb = DownloadManager.thumbsDirectory()
+                .appendingPathComponent("\(id.uuidString).jpg")
+            try? FileManager.default.removeItem(at: thumb)
+        }
+        saveLibrary()
+        saveCollections()
+    }
+
     func clear() {
-        for item in items { remove(item) }
+        remove(items)
     }
 
     // MARK: - Tiers & collections
