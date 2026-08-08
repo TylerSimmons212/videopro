@@ -205,7 +205,7 @@ final class DownloadManager {
             self?.forget(id)
             let ok = proc.terminationStatus == 0
             let path = run.lastPath
-            if ok { Self.cleanupSidecars(mainFile: path) }
+            if ok { Self.retainSubtitles(mainFile: path, id: id) }
             let stalled = run.stalled
             let drmBlocked = run.drmBlocked
             Task { @MainActor in
@@ -362,10 +362,30 @@ final class DownloadManager {
         }
     }
 
-    /// Remove sidecar subtitle files yt-dlp leaves next to the output once subs
-    /// are embedded (e.g. "Title.en.srt", "Title.en-orig.srt"), so the folder
-    /// stays clean.
-    static func cleanupSidecars(mainFile: String) {
+    /// Where retained subtitle tracks live, keyed by item id.
+    static func subtitlesDirectory() -> URL {
+        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+            .appendingPathComponent("VideoPro/subtitles", isDirectory: true)
+        try? FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
+        return base
+    }
+
+    /// The retained subtitle file for an item, if one was kept.
+    static func subtitleFile(for id: UUID) -> URL? {
+        let url = subtitlesDirectory().appendingPathComponent("\(id.uuidString).srt")
+        return FileManager.default.fileExists(atPath: url.path) ? url : nil
+    }
+
+    /// Keep one subtitle track, discard the rest.
+    ///
+    /// yt-dlp leaves sidecars next to the output ("Title.en.srt",
+    /// "Title.en-orig.srt") after embedding them, and these used to be deleted
+    /// outright to keep the folder tidy. But a timed subtitle file is a transcript
+    /// with timestamps — the input the clip-suggestion work needs (PLAN.md M7), and
+    /// far cheaper than re-transcribing audio we already had the text for. So keep
+    /// the best one out of the way in Application Support rather than throwing it
+    /// away, and still leave the download folder clean.
+    static func retainSubtitles(mainFile: String, id: UUID) {
         guard !mainFile.isEmpty else { return }
         let url = URL(fileURLWithPath: mainFile)
         let dir = url.deletingLastPathComponent()
@@ -375,10 +395,31 @@ final class DownloadManager {
         guard !stem.isEmpty,
               let entries = try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil)
         else { return }
-        for entry in entries where subExts.contains(entry.pathExtension.lowercased()) {
-            if entry.lastPathComponent.hasPrefix(stem) {
-                try? fm.removeItem(at: entry)
+
+        let sidecars = entries.filter {
+            subExts.contains($0.pathExtension.lowercased()) && $0.lastPathComponent.hasPrefix(stem)
+        }
+        guard !sidecars.isEmpty else { return }
+
+        // Prefer a real .srt, and prefer a human track over yt-dlp's "-orig"
+        // auto-generated one, which is unpunctuated and noticeably worse to read.
+        let best = sidecars.min { a, b in
+            func rank(_ u: URL) -> Int {
+                var score = 0
+                if u.pathExtension.lowercased() != "srt" { score += 2 }
+                if u.lastPathComponent.contains("-orig") { score += 1 }
+                return score
             }
+            return rank(a) < rank(b)
+        }
+
+        if let best {
+            let dest = subtitlesDirectory().appendingPathComponent("\(id.uuidString).srt")
+            try? fm.removeItem(at: dest)
+            try? fm.moveItem(at: best, to: dest)
+        }
+        for entry in sidecars where entry != best {
+            try? fm.removeItem(at: entry)
         }
     }
 

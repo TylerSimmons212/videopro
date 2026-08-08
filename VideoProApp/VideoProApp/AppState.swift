@@ -567,6 +567,9 @@ final class AppState: ObservableObject {
         let thumb = DownloadManager.thumbsDirectory()
             .appendingPathComponent("\(item.id.uuidString).jpg")
         try? FileManager.default.removeItem(at: thumb)
+        if let subs = DownloadManager.subtitleFile(for: item.id) {
+            try? FileManager.default.removeItem(at: subs)
+        }
         saveLibrary()
         saveCollections()
     }
@@ -588,6 +591,9 @@ final class AppState: ObservableObject {
             let thumb = DownloadManager.thumbsDirectory()
                 .appendingPathComponent("\(id.uuidString).jpg")
             try? FileManager.default.removeItem(at: thumb)
+            if let subs = DownloadManager.subtitleFile(for: id) {
+                try? FileManager.default.removeItem(at: subs)
+            }
         }
         saveLibrary()
         saveCollections()
