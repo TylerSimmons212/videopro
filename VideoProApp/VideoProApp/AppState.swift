@@ -40,6 +40,16 @@ final class AppState: ObservableObject {
     /// System-wide hotkey for the fast path.
     @Published var hotKeyEnabled = true { didSet { persistPrefs(); applyHotKey() } }
 
+    /// Whether the loopback server for the browser extension is listening.
+    ///
+    /// Off unless the extension is actually being used. The server has no way to
+    /// tell a request from the extension apart from one forged by any page you
+    /// happen to be visiting — `focus.js` is a content script, so its requests
+    /// carry the *page's* origin, not the extension's. Now that the hotkey and
+    /// menu bar cover the common path without it, the honest default is not to
+    /// listen at all. Turning it on is a deliberate act, tied to extension setup.
+    @Published var serverEnabled = false { didSet { persistPrefs(); applyServerSetting() } }
+
     /// The combination the fast path listens for. User-changeable, because the
     /// default can collide with whatever else they've installed.
     @Published var hotKeyCombo: KeyCombo = .fallback { didSet { persistPrefs(); applyHotKey() } }
@@ -80,7 +90,7 @@ final class AppState: ObservableObject {
             self.downloadFolder = saved
         }
         self.everConnected = UserDefaults.standard.bool(forKey: "everConnected")
-        loadPrefs()
+        loadPrefs()   // reads everConnected above for the serverEnabled default
 
         // Throttled so a burst of transitions coalesces into one re-render.
         VideoItem.statusChanged
@@ -110,6 +120,7 @@ final class AppState: ObservableObject {
         static let subs = "embedSubtitles"
         static let cookieBrowser = "cookieBrowserID"
         static let hotKey = "hotKeyEnabled"
+        static let server = "serverEnabled"
         static let hotKeyCode = "hotKeyCode"
         static let hotKeyModifiers = "hotKeyModifiers"
     }
@@ -126,6 +137,11 @@ final class AppState: ObservableObject {
         if d.object(forKey: PrefKey.subs) != nil { embedSubtitles = d.bool(forKey: PrefKey.subs) }
         cookieBrowserID = d.string(forKey: PrefKey.cookieBrowser)
         if d.object(forKey: PrefKey.hotKey) != nil { hotKeyEnabled = d.bool(forKey: PrefKey.hotKey) }
+        // Migration: someone already using the extension must not silently lose it
+        // on update, so an existing connection counts as consent.
+        serverEnabled = d.object(forKey: PrefKey.server) != nil
+            ? d.bool(forKey: PrefKey.server)
+            : everConnected
         if d.object(forKey: PrefKey.hotKeyCode) != nil,
            d.object(forKey: PrefKey.hotKeyModifiers) != nil {
             hotKeyCombo = KeyCombo(keyCode: UInt32(d.integer(forKey: PrefKey.hotKeyCode)),
@@ -144,6 +160,7 @@ final class AppState: ObservableObject {
         d.set(embedSubtitles, forKey: PrefKey.subs)
         d.set(cookieBrowserID, forKey: PrefKey.cookieBrowser)
         d.set(hotKeyEnabled, forKey: PrefKey.hotKey)
+        d.set(serverEnabled, forKey: PrefKey.server)
         d.set(Int(hotKeyCombo.keyCode), forKey: PrefKey.hotKeyCode)
         d.set(Int(hotKeyCombo.modifiers), forKey: PrefKey.hotKeyModifiers)
     }
@@ -180,7 +197,7 @@ final class AppState: ObservableObject {
         expireInbox()
         refreshTools()
         requestNotifications()
-        startServer()
+        applyServerSetting()
         applyCookieSetting()
         applyHotKey()
 
@@ -372,6 +389,19 @@ final class AppState: ObservableObject {
             toolSummary = "yt-dlp: \((yt as NSString).lastPathComponent) · \(ff)"
         } else {
             toolSummary = "yt-dlp not found — install with `brew install yt-dlp`"
+        }
+    }
+
+    /// Bring the listener in line with the setting.
+    func applyServerSetting() {
+        if serverEnabled {
+            guard server == nil else { return }
+            startServer()
+        } else {
+            server?.stop()
+            server = nil
+            serverRunning = false
+            serverStatus = "Off — not needed unless you use the browser extension"
         }
     }
 
@@ -1204,6 +1234,8 @@ final class AppState: ObservableObject {
     /// folder path, reveal it in Finder, and deep-link the browser straight to
     /// its extensions page.
     func setUpExtension(in browser: BrowserTarget) {
+        // Setting the extension up is the consent: it cannot reach us otherwise.
+        serverEnabled = true
         guard browser.kind == .chromium else {
             openSafariExtensionSettings()
             return
@@ -1251,6 +1283,9 @@ final class AppState: ObservableObject {
     /// path that does work here — loading the unpacked folder via Develop → Add
     /// Temporary Extension.
     func openSafariExtensionSettings() {
+        // Safari reaches us over the videopro:// scheme rather than the port, but
+        // enable it anyway so the two browsers behave the same.
+        serverEnabled = true
         SFSafariApplication.showPreferencesForExtension(withIdentifier: "com.videopro.app.safari") { [weak self] error in
             guard error != nil else { return }
             Task { @MainActor in self?.safariFallback() }

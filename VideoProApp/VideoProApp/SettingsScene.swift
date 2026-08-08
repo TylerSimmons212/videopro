@@ -131,20 +131,28 @@ private struct AdvancedSettingsTab: View {
             }
 
             Section {
-                HStack(spacing: 7) {
-                    Circle()
-                        .fill(state.serverRunning ? Color.green : Color.orange)
-                        .frame(width: 8, height: 8)
-                    Text(state.serverRunning
-                         ? "Active · listening on 127.0.0.1:\(state.port)"
-                         : state.serverStatus)
-                        .font(.caption).foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
+                Toggle(isOn: $state.serverEnabled) {
+                    Text("Accept videos from the browser extension")
+                }
+                if state.serverEnabled {
+                    HStack(spacing: 7) {
+                        Circle()
+                            .fill(state.serverRunning ? Color.green : Color.orange)
+                            .frame(width: 8, height: 8)
+                        Text(state.serverRunning
+                             ? "Listening on 127.0.0.1:\(state.port)"
+                             : state.serverStatus)
+                            .font(.caption).foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
                 }
             } header: {
                 Text("Local connection")
             } footer: {
-                Text("Only the browser extension uses this. Everything else in VideoPro works without it.")
+                // Say plainly what leaving it on costs, without melodrama.
+                Text(state.serverEnabled
+                     ? "While this is on, VideoPro listens on a local port. It can't tell an extension request apart from one made by a page you're visiting, so leave it off unless you use the extension."
+                     : "Off. The global shortcut, the menu bar and dragging files in all work without it — only the browser extension needs it.")
                     .font(.caption).foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
