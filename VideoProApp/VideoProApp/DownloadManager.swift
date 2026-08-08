@@ -445,8 +445,20 @@ final class DownloadManager {
     /// blob/DRM/unreachable sources. Best-effort with a hard timeout.
     func generateThumbnail(for meta: VideoMeta, id: UUID, seek: Double = 3) async -> String? {
         guard let ffmpeg = locate("ffmpeg") else { return nil }
-        let src = meta.downloadURL
-        guard src.hasPrefix("http") else { return nil }
+        // An imported file is read straight off disk; only remote sources have to
+        // be an http(s) URL. Anything else (blob:, data:) ffmpeg can't open.
+        let src: String
+        if let local = meta.filePath, FileManager.default.fileExists(atPath: local) {
+            src = local
+        } else if meta.downloadURL.hasPrefix("http") {
+            src = meta.downloadURL
+        } else {
+            return nil
+        }
+        // Seeking past the end yields no frame at all, which is easy to hit on the
+        // short clips people import.
+        var seek = seek
+        if let d = meta.duration, d > 0, seek >= d { seek = max(0, d / 2) }
         let out = Self.thumbsDirectory().appendingPathComponent("\(id.uuidString).jpg")
 
         return await withCheckedContinuation { continuation in

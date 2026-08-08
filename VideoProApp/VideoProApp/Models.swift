@@ -34,6 +34,18 @@ struct VideoMeta: Codable, Equatable, Identifiable, Sendable {
     var tags: [String] = []
     var collectionIDs: [UUID] = []
 
+    /// Set when the user imported a file that VideoPro didn't fetch.
+    ///
+    /// This is the field that breaks the old assumption that every item has a
+    /// remote source: an imported file has no page, no media URL, and nothing for
+    /// yt-dlp to do. Anything that reads `downloadURL` has to cope with "" — see
+    /// `isLocal`, which is the check to branch on.
+    var importedPath: String? = nil
+
+    /// Technical detail from ffprobe. Cached because probing costs a subprocess
+    /// and the answer can't change unless the file does.
+    var probe: MediaInfo? = nil
+
     /// Decoded by hand so libraries written before these fields existed still
     /// load. Swift's synthesised `Decodable` throws on a missing key even when the
     /// property has a default, so every new field has to be `decodeIfPresent`.
@@ -56,6 +68,8 @@ struct VideoMeta: Codable, Equatable, Identifiable, Sendable {
         tier = try c.decodeIfPresent(LibraryTier.self, forKey: .tier) ?? .kept
         tags = try c.decodeIfPresent([String].self, forKey: .tags) ?? []
         collectionIDs = try c.decodeIfPresent([UUID].self, forKey: .collectionIDs) ?? []
+        importedPath = try c.decodeIfPresent(String.self, forKey: .importedPath)
+        probe = try c.decodeIfPresent(MediaInfo.self, forKey: .probe)
     }
 
     init(title: String, pageURL: String, mediaURL: String, sourceKind: String,
@@ -72,6 +86,30 @@ struct VideoMeta: Codable, Equatable, Identifiable, Sendable {
         self.platform = platform
         self.tier = tier
     }
+
+    /// A file the user brought in themselves. `.kept` immediately: importing is
+    /// an explicit act, so it would be wrong to expire it out of the Inbox.
+    init(importing url: URL) {
+        self.title = url.deletingPathExtension().lastPathComponent
+        self.pageURL = ""
+        self.mediaURL = ""
+        self.sourceKind = "local"
+        self.thumbnail = ""
+        self.duration = nil
+        self.width = 0
+        self.height = 0
+        self.platform = nil
+        self.importedPath = url.path
+        self.tier = .kept
+    }
+
+    /// True when the bytes are already on disk and there is nothing to fetch.
+    /// Branch on this rather than testing `downloadURL.isEmpty`, which is also
+    /// true for a malformed remote item.
+    var isLocal: Bool { importedPath != nil }
+
+    /// Where the file lives, whether it was imported or downloaded.
+    var filePath: String? { importedPath ?? downloadedPath }
 
     /// The URL we hand to yt-dlp. Prefer the page URL for platform pages,
     /// otherwise fall back to the direct media URL.

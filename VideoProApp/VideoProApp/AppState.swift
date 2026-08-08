@@ -466,6 +466,74 @@ final class AppState: ObservableObject {
         return item
     }
 
+    // MARK: - Local files
+
+    /// File types worth offering in the open panel / accepting on a drop.
+    static let importableExtensions: Set<String> = [
+        "mp4", "m4v", "mov", "mkv", "webm", "avi", "flv", "wmv", "mpg", "mpeg", "ts", "m2ts",
+        "mp3", "m4a", "aac", "wav", "flac", "aiff", "ogg", "opus",
+    ]
+
+    /// Bring files the user already has into the library.
+    ///
+    /// The file is referenced where it sits — deliberately not copied. Importing
+    /// a 4GB movie should not silently duplicate it, and the user's own folder
+    /// layout is not ours to reorganise.
+    @discardableResult
+    func importFiles(_ urls: [URL]) -> [VideoItem] {
+        var added: [VideoItem] = []
+        for url in urls {
+            guard Self.importableExtensions.contains(url.pathExtension.lowercased()) else { continue }
+            guard FileManager.default.fileExists(atPath: url.path) else { continue }
+            // Same file twice is almost always a mistake rather than intent.
+            if items.contains(where: { $0.meta.importedPath == url.path }) { continue }
+            let item = VideoItem(VideoMeta(importing: url))
+            item.markDone(path: url.path)   // it's already "downloaded" — it's right there
+            items.insert(item, at: 0)
+            added.append(item)
+            probeLocal(item)
+        }
+        if !added.isEmpty { saveLibrary() }
+        return added
+    }
+
+    func chooseFilesToImport() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = true
+        panel.prompt = "Import"
+        panel.message = "Choose video or audio files to add to your library."
+        if panel.runModal() == .OK { importFiles(panel.urls) }
+    }
+
+    /// Fill in what we can read straight off the file: technical detail from
+    /// ffprobe, then a poster frame from ffmpeg.
+    func probeLocal(_ item: VideoItem) {
+        guard let path = item.meta.filePath, !item.probing else { return }
+        item.probing = true
+        Task {
+            if let info = await MediaProbe.shared.probe(path: path) {
+                item.meta.probe = info
+                if let d = info.duration, d > 0 { item.meta.duration = d }
+                if let v = info.video {
+                    item.meta.width = v.width
+                    item.meta.height = v.height
+                    item.availableHeights = v.height > 0 ? [v.height] : []
+                }
+                saveLibrary()
+            }
+            if !Self.hasDisplayableThumbnail(item.thumbnail),
+               let path = await DownloadManager.shared.generateThumbnail(for: item.meta, id: item.id) {
+                item.thumbnail = path
+                item.meta.thumbnail = path
+                saveLibrary()
+            }
+            item.enriched = true
+            item.probing = false
+        }
+    }
+
     func remove(_ item: VideoItem) {
         items.removeAll { $0.id == item.id }
         for idx in collections.indices {
@@ -530,7 +598,7 @@ final class AppState: ObservableObject {
     private func expireInbox() {
         let cutoff = Date().addingTimeInterval(-Double(inboxExpiryDays) * 86_400)
         let stale = items.filter {
-            $0.meta.tier == .inbox && $0.meta.receivedAt < cutoff
+            $0.meta.tier == .inbox && !$0.meta.isLocal && $0.meta.receivedAt < cutoff
                 && $0.status != .downloading && $0.status != .queued
         }
         guard !stale.isEmpty else { return }
@@ -610,6 +678,8 @@ final class AppState: ObservableObject {
     /// Queue a download at the given quality (inherits the global embed toggles).
     /// Runs at most `maxConcurrent` at once; the rest wait their turn.
     func download(_ item: VideoItem, quality: DownloadQuality? = nil) {
+        // Nothing to fetch for a file that's already on disk.
+        guard !item.meta.isLocal else { return }
         guard item.status != .downloading, item.status != .queued else { return }
         item.status = .queued
         item.statusLine = "Queued…"
@@ -685,6 +755,9 @@ final class AppState: ObservableObject {
     /// Fetch a video's real thumbnail + available qualities via yt-dlp. Runs once
     /// per item (on arrival, and on-demand when the download menu opens).
     func enrich(_ item: VideoItem) {
+        // An imported file has no remote source; ffprobe is the right tool, not
+        // yt-dlp, and asking yt-dlp to resolve "" wastes a subprocess per item.
+        if item.meta.isLocal { probeLocal(item); return }
         guard !item.enriched, !item.probing else { return }
         item.probing = true
 
@@ -779,13 +852,15 @@ final class AppState: ObservableObject {
 
     /// True when we already hold the bytes locally — the export is then instant.
     func hasLocalFile(_ item: VideoItem) -> Bool {
-        !item.outputPath.isEmpty && FileManager.default.fileExists(atPath: item.outputPath)
+        guard let path = item.meta.filePath ?? (item.outputPath.isEmpty ? nil : item.outputPath)
+        else { return false }
+        return FileManager.default.fileExists(atPath: path)
     }
 
     /// True when we can export at all: either we have the file, or we know where
     /// to get it. Downloading first is *not* a prerequisite.
     func canExport(_ item: VideoItem) -> Bool {
-        hasLocalFile(item) || !item.meta.downloadURL.isEmpty
+        hasLocalFile(item) || !item.meta.downloadURL.isEmpty || item.meta.isLocal
     }
 
     /// Export a clip, GIF, or MP3. Works whether or not the video has been

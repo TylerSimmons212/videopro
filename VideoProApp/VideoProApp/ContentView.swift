@@ -16,6 +16,7 @@ enum LibraryScope: Hashable, Identifiable {
     case all
     case collection(UUID)
     case smart(SmartFilter)
+    case local
 
     var id: String {
         switch self {
@@ -23,6 +24,7 @@ enum LibraryScope: Hashable, Identifiable {
         case .all: return "all"
         case .collection(let id): return "c-\(id.uuidString)"
         case .smart(let f): return "s-\(f.rawValue)"
+        case .local: return "local"
         }
     }
 
@@ -32,6 +34,7 @@ enum LibraryScope: Hashable, Identifiable {
         case .all: return "square.stack"
         case .collection: return "folder"
         case .smart(let f): return f.systemImage
+        case .local: return "internaldrive"
         }
     }
 
@@ -41,6 +44,7 @@ enum LibraryScope: Hashable, Identifiable {
         case .all: return true
         case .collection(let id): return item.meta.collectionIDs.contains(id)
         case .smart(let f): return f.matches(item)
+        case .local: return item.meta.isLocal
         }
     }
 }
@@ -148,6 +152,11 @@ struct SidebarView: View {
             Section("Library") {
                 row(.inbox, "Inbox")
                 row(.all, "All Videos")
+                // Only worth a row once the user has actually imported something;
+                // a downloader-only user should never wonder what it means.
+                if state.items.contains(where: { $0.meta.isLocal }) {
+                    row(.local, "Local Files")
+                }
             }
 
             // Stays hidden until one exists — a new user should never meet an
@@ -292,6 +301,7 @@ struct LibraryView: View {
     @State private var urlText = ""
     @State private var search = ""
     @State private var status: StatusFilter = .all
+    @State private var dropTargeted = false
     @State private var sort: LibrarySort = .newest
     @State private var selection = Set<UUID>()
     @State private var pendingRemoval: [VideoItem] = []
@@ -353,6 +363,19 @@ struct LibraryView: View {
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
+        // Dropping a file anywhere in the library imports it. Referenced in place,
+        // never copied — see AppState.importFiles.
+        .dropDestination(for: URL.self) { urls, _ in
+            !state.importFiles(urls).isEmpty
+        } isTargeted: { dropTargeted = $0 }
+        .overlay {
+            if dropTargeted {
+                RoundedRectangle(cornerRadius: 10)
+                    .strokeBorder(Color.accentColor, style: StrokeStyle(lineWidth: 2, dash: [7]))
+                    .padding(6)
+                    .allowsHitTesting(false)
+            }
+        }
         // A filter or sort change must not silently widen or narrow what a
         // batch action is about to hit, so anything that scrolls out of the
         // filtered set leaves the selection with it.
@@ -386,6 +409,7 @@ struct LibraryView: View {
         case .collection(let id):
             return state.collections.first { $0.id == id }?.name ?? "Collection"
         case .smart(let f): return f.rawValue
+        case .local: return "Local Files"
         }
     }
 
@@ -553,6 +577,9 @@ struct LibraryView: View {
     @ToolbarContentBuilder
     private var toolbarContent: some ToolbarContent {
         ToolbarItemGroup(placement: .primaryAction) {
+            Button { state.chooseFilesToImport() } label: { Image(systemName: "folder.badge.plus") }
+                .help("Import files from your Mac")
+
             Button { showAddURL.toggle() } label: { Image(systemName: "plus") }
                 .help("Add a video by URL")
                 .popover(isPresented: $showAddURL, arrowEdge: .bottom) { addURLPopover }
