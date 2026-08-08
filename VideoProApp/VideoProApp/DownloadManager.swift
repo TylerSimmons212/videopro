@@ -208,7 +208,7 @@ final class DownloadManager {
             self?.forget(id)
             let ok = proc.terminationStatus == 0
             let path = run.lastPath
-            if ok { Self.retainSubtitles(mainFile: path, id: id) }
+            if ok { Self.cleanupSidecars(mainFile: path) }
             let stalled = run.stalled
             let drmBlocked = run.drmBlocked
             Task { @MainActor in
@@ -365,132 +365,22 @@ final class DownloadManager {
         }
     }
 
-    /// Where retained subtitle tracks live, keyed by item id.
-    static func subtitlesDirectory() -> URL {
-        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-            .appendingPathComponent("VideoPro/subtitles", isDirectory: true)
-        try? FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
-        return base
-    }
-
-    /// Formats we retain — and can actually parse. `.ass` and `.lrc` are
-    /// deliberately excluded: keeping a transcript nothing can read is worse than
-    /// keeping none, because it looks like the feature is broken rather than
-    /// unavailable.
-    static let retainableSubtitleExtensions: Set<String> = ["srt", "vtt"]
-
-    /// The retained subtitle file for an item, if one was kept.
-    static func subtitleFile(for id: UUID) -> URL? {
-        let dir = subtitlesDirectory()
-        for ext in ["srt", "vtt"] {
-            let url = dir.appendingPathComponent("\(id.uuidString).\(ext)")
-            if FileManager.default.fileExists(atPath: url.path) { return url }
-        }
-        return nil
-    }
-
-    /// Keep one subtitle track, discard the rest.
-    ///
-    /// yt-dlp leaves sidecars next to the output ("Title.en.srt",
-    /// "Title.en-orig.srt") after embedding them, and these used to be deleted
-    /// outright to keep the folder tidy. But a timed subtitle file is a transcript
-    /// with timestamps — the input the clip-suggestion work needs (PLAN.md M7), and
-    /// far cheaper than re-transcribing audio we already had the text for. So keep
-    /// the best one out of the way in Application Support rather than throwing it
-    /// away, and still leave the download folder clean.
-    static func retainSubtitles(mainFile: String, id: UUID) {
+    /// Remove the subtitle sidecars yt-dlp leaves next to the output once they're
+    /// embedded ("Title.en.srt", "Title.en-orig.srt"), so the download folder
+    /// stays clean. The subtitles themselves live in the video from here on.
+    static func cleanupSidecars(mainFile: String) {
         guard !mainFile.isEmpty else { return }
         let url = URL(fileURLWithPath: mainFile)
         let dir = url.deletingLastPathComponent()
         let stem = url.deletingPathExtension().lastPathComponent
-        let subExts = Self.retainableSubtitleExtensions
+        let subExts: Set<String> = ["srt", "vtt", "ass", "lrc"]
         let fm = FileManager.default
         guard !stem.isEmpty,
               let entries = try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil)
         else { return }
-
-        let sidecars = entries.filter {
-            subExts.contains($0.pathExtension.lowercased()) && $0.lastPathComponent.hasPrefix(stem)
-        }
-        guard !sidecars.isEmpty else { return }
-
-        // Prefer a real .srt, and prefer a human track over yt-dlp's "-orig"
-        // auto-generated one, which is unpunctuated and noticeably worse to read.
-        let best = sidecars.min { a, b in
-            func rank(_ u: URL) -> Int {
-                var score = 0
-                if u.pathExtension.lowercased() != "srt" { score += 2 }
-                if u.lastPathComponent.contains("-orig") { score += 1 }
-                return score
-            }
-            return rank(a) < rank(b)
-        }
-
-        if let best {
-            // Keep the REAL extension. This used to rename whatever it picked to
-            // ".srt" with no conversion, so a WebVTT file was stored under a name
-            // that lied about its format — fine for a parser that sniffs content,
-            // a trap for anything that trusts the path.
-            let ext = best.pathExtension.lowercased()
-            for stale in ["srt", "vtt"] {
-                try? fm.removeItem(at: subtitlesDirectory()
-                    .appendingPathComponent("\(id.uuidString).\(stale)"))
-            }
-            let dest = subtitlesDirectory().appendingPathComponent("\(id.uuidString).\(ext)")
-            try? fm.moveItem(at: best, to: dest)
-        }
-        for entry in sidecars where entry != best {
-            try? fm.removeItem(at: entry)
-        }
-    }
-
-    /// Pull an embedded subtitle track out of a container.
-    ///
-    /// Downloads made before subtitles were retained have their captions muxed
-    /// into the file and no sidecar, so without this the clip finder is dark on
-    /// every video already in someone's library.
-    func extractSubtitles(from path: String, id: UUID) async -> URL? {
-        guard let ffmpeg = locate("ffmpeg"),
-              FileManager.default.fileExists(atPath: path) else { return nil }
-        let out = Self.subtitlesDirectory().appendingPathComponent("\(id.uuidString).srt")
-
-        return await withCheckedContinuation { continuation in
-            probeQueue.addOperation {
-                let process = Process()
-                process.executableURL = URL(fileURLWithPath: ffmpeg)
-                // First subtitle stream only, converted to srt. Fails cleanly when
-                // the file has no subtitle stream at all, which is the common case.
-                process.arguments = ["-y", "-nostdin", "-i", path,
-                                     "-map", "0:s:0", "-c:s", "srt", out.path]
-                let sink = Pipe(), errSink = Pipe()
-                process.standardOutput = sink
-                process.standardError = errSink
-                let drain: @Sendable (FileHandle) -> Void = { _ = $0.availableData }
-                sink.fileHandleForReading.readabilityHandler = drain
-                errSink.fileHandleForReading.readabilityHandler = drain
-
-                var done = false
-                let lock = NSLock()
-                func finish(_ value: URL?) {
-                    lock.lock(); defer { lock.unlock() }
-                    if done { return }
-                    done = true
-                    sink.fileHandleForReading.readabilityHandler = nil
-                    errSink.fileHandleForReading.readabilityHandler = nil
-                    continuation.resume(returning: value)
-                }
-                self.timerQueue.asyncAfter(deadline: .now() + 30) { [weak process] in
-                    if let process, process.isRunning { process.terminate() }
-                }
-                do {
-                    try process.run()
-                    process.waitUntilExit()
-                    let ok = process.terminationStatus == 0
-                        && FileManager.default.fileExists(atPath: out.path)
-                    finish(ok ? out : nil)
-                } catch {
-                    finish(nil)
-                }
+        for entry in entries where subExts.contains(entry.pathExtension.lowercased()) {
+            if entry.lastPathComponent.hasPrefix(stem) {
+                try? fm.removeItem(at: entry)
             }
         }
     }

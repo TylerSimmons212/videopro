@@ -567,9 +567,6 @@ final class AppState: ObservableObject {
         let thumb = DownloadManager.thumbsDirectory()
             .appendingPathComponent("\(item.id.uuidString).jpg")
         try? FileManager.default.removeItem(at: thumb)
-        if let subs = DownloadManager.subtitleFile(for: item.id) {
-            try? FileManager.default.removeItem(at: subs)
-        }
         saveLibrary()
         saveCollections()
     }
@@ -591,9 +588,6 @@ final class AppState: ObservableObject {
             let thumb = DownloadManager.thumbsDirectory()
                 .appendingPathComponent("\(id.uuidString).jpg")
             try? FileManager.default.removeItem(at: thumb)
-            if let subs = DownloadManager.subtitleFile(for: id) {
-                try? FileManager.default.removeItem(at: subs)
-            }
         }
         saveLibrary()
         saveCollections()
@@ -1133,50 +1127,6 @@ final class AppState: ObservableObject {
         try? await UNUserNotificationCenter.current().add(
             UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil))
         return true
-    }
-
-    // MARK: - Clip suggestions
-
-    enum ClipSource { case subtitles(SubtitleTranscript) }
-
-    /// The transcript for an item: a retained sidecar, or failing that whatever
-    /// is muxed into the file.
-    ///
-    /// The extraction fallback matters more than it sounds — every video
-    /// downloaded before subtitles were retained has its captions embedded and no
-    /// sidecar, so without it the feature is dark on an existing library.
-    func transcript(for item: VideoItem) async -> SubtitleTranscript? {
-        if let url = DownloadManager.subtitleFile(for: item.id),
-           let parsed = SubtitleTranscript.parse(fileURL: url) {
-            return parsed
-        }
-        guard let path = item.meta.filePath ?? (item.outputPath.isEmpty ? nil : item.outputPath),
-              let extracted = await DownloadManager.shared.extractSubtitles(from: path, id: item.id)
-        else { return nil }
-        return SubtitleTranscript.parse(fileURL: extracted)
-    }
-
-    /// Why clip-finding isn't available for this item, or nil when it is.
-    ///
-    /// Deliberately cheap and synchronous — it gates a menu item, so it can't go
-    /// probing files. Whether a transcript actually materialises is settled when
-    /// the finder runs.
-    func clipSuggestBlocker(for item: VideoItem) -> String? {
-        let availability = ClipSuggester.availability
-        if !availability.usable { return availability.reason }
-        if DownloadManager.subtitleFile(for: item.id) != nil { return nil }
-        if hasLocalFile(item) { return nil }   // subtitles may be embedded
-        return "Download this video first — clip finding reads its subtitles."
-    }
-
-    /// Turn a suggestion into an edit. This is the whole reason suggestions are
-    /// cheap to add: a clip is an EditRecipe with in/out set, so it rides the
-    /// editor and the export queue that already exist.
-    func recipe(for clip: SuggestedClip, basedOn item: VideoItem) -> EditRecipe {
-        var recipe = item.meta.recipe ?? .identity
-        recipe.inPoint = clip.start
-        recipe.outPoint = clip.end
-        return recipe
     }
 
     /// Filename-safe stem from a video title (temp sources are all "source.mp4").

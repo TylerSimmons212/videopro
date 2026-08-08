@@ -299,9 +299,6 @@ struct LibraryView: View {
 
     @Environment(\.openWindow) private var openWindow
     @State private var convertItem: VideoItem?
-    @State private var findClipsItem: VideoItem?
-    /// Carried from the finder into the editor so the sheet opens on the clip.
-    @State private var pendingClip: SuggestedClip?
     @State private var showAddURL = false
     @State private var showActivity = false
     @State private var urlText = ""
@@ -358,7 +355,6 @@ struct LibraryView: View {
                             VideoRow(item: item,
                                      onPlay: { play(item) },
                                      onExport: { convertItem = item },
-                                     onFindClips: { findClipsItem = item },
                                      selection: selection,
                                      selectedItems: { selectedItems },
                                      onRemove: requestRemoval)
@@ -419,17 +415,7 @@ struct LibraryView: View {
         .navigationSubtitle(subtitle)
         .searchable(text: $search, placement: .toolbar, prompt: "Search videos")
         .toolbar { toolbarContent }
-        .sheet(item: $convertItem) { EditorView(item: $0, initialClip: pendingClip).environmentObject(state) }
-        .sheet(item: $findClipsItem) { target in
-            ClipFinderView(item: target) { clip in
-                // Hand off to the editor rather than exporting blind: a suggestion
-                // is a starting point and the boundaries usually want a nudge.
-                pendingClip = clip
-                findClipsItem = nil
-                convertItem = target
-            }
-            .environmentObject(state)
-        }
+        .sheet(item: $convertItem) { EditorView(item: $0).environmentObject(state) }
     }
 
     private var title: String {
@@ -749,7 +735,6 @@ struct VideoRow: View {
     @ObservedObject var item: VideoItem
     let onPlay: () -> Void
     var onExport: () -> Void = {}
-    var onFindClips: () -> Void = {}
     /// The live list selection, so the row can tell whether a right-click on it
     /// is a right-click on the whole selection.
     var selection: Set<UUID> = []
@@ -871,8 +856,6 @@ struct VideoRow: View {
         if item.status == .idle || item.status == .error {
             Button("Download") { state.download(item) }
         }
-        Button("Find Clips…") { onFindClips() }
-            .disabled(state.clipSuggestBlocker(for: item) != nil)
         Button("Clip · GIF · MP3…", action: onExport)
             .disabled(item.busy || !state.canExport(item))
         if state.canExport(item), !item.outputPath.isEmpty {
@@ -1065,8 +1048,6 @@ struct QualityPopover: View {
 struct EditorView: View {
     @EnvironmentObject var state: AppState
     @ObservedObject var item: VideoItem
-    /// Set when the editor was opened from a found clip, so it starts on it.
-    var initialClip: SuggestedClip? = nil
     @Environment(\.dismiss) private var dismiss
 
     @State private var player: AVPlayer?
@@ -1190,15 +1171,8 @@ struct EditorView: View {
         guard loaded.isFinite, loaded > 0 else { resolving = false; return }
 
         duration = loaded
-        // A clip handed over from the finder wins over any stored recipe bounds —
-        // it's what the user just picked.
-        if let initialClip {
-            inPoint = max(0, min(initialClip.start, loaded))
-            outPoint = max(inPoint, min(initialClip.end, loaded))
-        } else {
-            inPoint = recipe.inPoint ?? 0
-            outPoint = recipe.outPoint ?? loaded
-        }
+        inPoint = recipe.inPoint ?? 0
+        outPoint = recipe.outPoint ?? loaded
         player = AVPlayer(playerItem: AVPlayerItem(asset: asset))
         resolving = false
     }

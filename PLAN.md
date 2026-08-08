@@ -173,43 +173,16 @@ when the source has none. Muting substitutes silence rather than dropping the
 track, for the same reason. Joins are letterboxed rather than cover-cropped — a
 collection is exactly where aspect ratios differ, and lost framing can't be undone.
 
-### M7 — On-device clip suggestions — **DONE**
+### M7 — On-device clip suggestions — **REMOVED**
 
-Depends on M5. **A suggested clip is just an `EditRecipe` with in/out set**, so
-this needs no new export path, job type, or persistence — it emits recipes and
-rides everything M4/M5 already do.
+Built and then taken out before release. It worked — query-driven search returned
+correct cue ranges and declined to invent clips for content that wasn't there —
+but it wasn't earning its place: it needs subtitles, needs Apple Intelligence
+enabled, and takes seconds per search to answer a question you can usually answer
+by scrubbing. Recoverable from git history if it's ever worth revisiting.
 
-Entirely on-device: `FoundationModels` (confirmed present in the macOS 27 SDK —
-`SystemLanguageModel`, `LanguageModelSession`, `@Generable` for structured
-output) plus `Speech` for transcription when there are no subtitles. Transcripts
-never leave the machine, which no cloud clipping tool can claim.
-
-- **Never let the model emit timestamps.** It will hallucinate them and produce
-  clips that start mid-syllable. Parse subtitles into numbered cues, feed the
-  model cue-indexed text, have it return *cue indices*, and map back to real times
-  ourselves. That also lands cuts on sentence boundaries for free.
-- **Cheap deterministic candidates first, model ranks and titles them.** Chapters
-  (already captured) are human-authored clip boundaries with no AI at all; ffmpeg
-  `select='gt(scene,0.4)'` gives visual cuts and `ebur128` finds laughter and
-  applause. A model that ranks a candidate list is far more robust than one asked
-  to find clips unaided.
-- **Query-driven beats taste-driven.** "Find where they discuss pricing" is
-  retrieval, which a small on-device model does well. "Find the best moments" is
-  judgement, which it does not. Ship the first; be sceptical of the second.
-- **Context window is a hard constraint** — the API has `exceededContextWindowSize`
-  and an hour of transcript will not fit. Needs map-reduce: score chunks, then a
-  second pass over the winners.
-- **Gate on availability** — `deviceNotEligible`, `appleIntelligenceNotEnabled`,
-  `modelNotReady` are all reachable. Degrade, don't break.
-
-Prerequisite cleared: `DownloadManager.retainSubtitles` now keeps one parseable
-track per video (`.srt`/`.vtt` only — an unreadable `.ass` looks like a broken
-feature rather than an absent one), under its real extension.
-
-yt-dlp's auto-generated captions roll: each cue restates the tail of the previous
-one and appends a few words, so raw parsing yields ~3x the actual speech and blows
-the context budget. `Transcript` strips that by longest suffix/prefix overlap —
-guarded, because the same trick would eat real repeated speech on a human track.
+Two things from it were kept, because they were real bugs rather than feature code:
+the `--sub-langs` fix (see debt list) and the paced subtitle requests.
 
 ---
 
