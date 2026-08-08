@@ -173,7 +173,7 @@ when the source has none. Muting substitutes silence rather than dropping the
 track, for the same reason. Joins are letterboxed rather than cover-cropped — a
 collection is exactly where aspect ratios differ, and lost framing can't be undone.
 
-### M7 — On-device clip suggestions
+### M7 — On-device clip suggestions — **DONE**
 
 Depends on M5. **A suggested clip is just an `EditRecipe` with in/out set**, so
 this needs no new export path, job type, or persistence — it emits recipes and

@@ -1,8 +1,8 @@
 import Foundation
 // Name collision worth knowing about: FoundationModels exports its own
-// `Transcript` (the model's conversation history). Our subtitle `Transcript`
+// `SubtitleTranscript` (the model's conversation history). Our subtitle `SubtitleTranscript`
 // wins here because a same-module declaration outranks an imported one — but
-// that's the only thing keeping them apart, so if `Transcript.swift` is ever
+// that's the only thing keeping them apart, so if `SubtitleTranscript.swift` is ever
 // moved into a separate module this file starts silently type-checking against
 // Apple's. Verified against the real framework, not assumed.
 import FoundationModels
@@ -166,20 +166,20 @@ final class ClipSuggester {
     // MARK: Entry points
 
     /// Retrieval: find segments matching what the user asked for.
-    func find(_ query: String, in transcript: Transcript, limit: Int = 5) async throws -> [SuggestedClip] {
+    func find(_ query: String, in transcript: SubtitleTranscript, limit: Int = 5) async throws -> [SuggestedClip] {
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return try await suggest(in: transcript, limit: limit) }
         return try await run(transcript: transcript, limit: limit, query: trimmed)
     }
 
     /// Taste: no query, the model picks what stands alone.
-    func suggest(in transcript: Transcript, limit: Int = 5) async throws -> [SuggestedClip] {
+    func suggest(in transcript: SubtitleTranscript, limit: Int = 5) async throws -> [SuggestedClip] {
         try await run(transcript: transcript, limit: limit, query: nil)
     }
 
     // MARK: Map-reduce
 
-    private func run(transcript: Transcript, limit: Int, query: String?) async throws -> [SuggestedClip] {
+    private func run(transcript: SubtitleTranscript, limit: Int, query: String?) async throws -> [SuggestedClip] {
         let gate = Self.availability
         guard gate.usable else { throw ClipSuggestError.unavailable(gate.reason) }
         guard !transcript.isEmpty else { throw ClipSuggestError.noTranscript }
@@ -234,7 +234,7 @@ final class ClipSuggester {
     /// Failure here is not fatal: an unreadable answer keeps the unfiltered list,
     /// since a slightly noisy result beats no result.
     private func reduce(_ candidates: [SuggestedClip], query: String,
-                        transcript: Transcript) async -> [SuggestedClip] {
+                        transcript: SubtitleTranscript) async -> [SuggestedClip] {
         let listing = candidates.enumerated().map { i, clip -> String in
             let body = transcript.cues(from: clip.startCue, to: clip.endCue)
                 .map(\.text).joined(separator: " ")
@@ -389,14 +389,14 @@ final class ClipSuggester {
 
             If none of the transcript below is about that, return an empty list.
 
-            Transcript:
+            SubtitleTranscript:
             \(chunk)
             """
         }
         return """
         Choose up to \(limit) segments from the transcript below that would work as standalone clips.
 
-        Transcript:
+        SubtitleTranscript:
         \(chunk)
         """
     }
@@ -452,7 +452,7 @@ final class ClipSuggester {
         return lo...hi
     }
 
-    private func validate(_ raw: [ModelClip], transcript: Transcript,
+    private func validate(_ raw: [ModelClip], transcript: SubtitleTranscript,
                           chunkBounds: ClosedRange<Int>?) -> [SuggestedClip] {
         guard let first = transcript.cues.first, let last = transcript.cues.last else { return [] }
         let global = first.index...last.index

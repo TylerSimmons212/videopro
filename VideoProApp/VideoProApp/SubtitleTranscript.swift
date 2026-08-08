@@ -1,7 +1,7 @@
 import Foundation
 
 /// One timed line of a transcript.
-struct TranscriptCue: Identifiable, Equatable, Sendable {
+struct SubtitleCue: Identifiable, Equatable, Sendable {
     let id: Int
     let index: Int
     let start: Double
@@ -16,9 +16,9 @@ struct TranscriptCue: Identifiable, Equatable, Sendable {
 /// times here. That means index stability is a contract, not a convenience: the
 /// indices this type hands out in `numberedChunks` are the same ones `timeRange`
 /// resolves, so cues are renumbered exactly once, after all cleanup.
-struct Transcript: Equatable, Sendable {
+struct SubtitleTranscript: Equatable, Sendable {
 
-    let cues: [TranscriptCue]
+    let cues: [SubtitleCue]
 
     /// End of the last cue. Not the video's duration — a transcript usually stops
     /// before the video does.
@@ -26,11 +26,11 @@ struct Transcript: Equatable, Sendable {
 
     var isEmpty: Bool { cues.isEmpty }
 
-    init(cues: [TranscriptCue]) { self.cues = cues }
+    init(cues: [SubtitleCue]) { self.cues = cues }
 
     // MARK: - Parsing
 
-    static func parse(fileURL: URL) -> Transcript? {
+    static func parse(fileURL: URL) -> SubtitleTranscript? {
         guard let data = try? Data(contentsOf: fileURL) else { return nil }
         // `DownloadManager.retainSubtitles` names its kept file ".srt" whatever it
         // actually moved, so the extension proves nothing and we sniff instead.
@@ -40,7 +40,7 @@ struct Transcript: Equatable, Sendable {
         return parse(text: text)
     }
 
-    static func parse(text: String) -> Transcript? {
+    static func parse(text: String) -> SubtitleTranscript? {
         let raw = rawCues(in: text)
         guard !raw.isEmpty else { return nil }
 
@@ -54,9 +54,9 @@ struct Transcript: Equatable, Sendable {
         guard !merged.isEmpty else { return nil }
 
         let cues = merged.enumerated().map { i, d in
-            TranscriptCue(id: i, index: i, start: d.start, end: d.end, text: d.text)
+            SubtitleCue(id: i, index: i, start: d.start, end: d.end, text: d.text)
         }
-        return Transcript(cues: cues)
+        return SubtitleTranscript(cues: cues)
     }
 
     // MARK: - Slicing
@@ -70,20 +70,31 @@ struct Transcript: Equatable, Sendable {
     func numberedChunks(maxCharacters: Int) -> [String] {
         guard !cues.isEmpty else { return [] }
         let cap = max(1, maxCharacters)
+        let lines = cues.map { "[\($0.index)] \($0.text)" }
+
+        // Balanced, not greedy. Filling each chunk to the cap leaves whatever is
+        // left over as a stub — and a short chunk is actively harmful here, because
+        // every chunk is scored in isolation and asked for its best matches, so a
+        // six-cue tail will pad with something irrelevant rather than return
+        // nothing. Aim for equal chunks instead: same count, no runt.
+        let total = lines.reduce(0) { $0 + $1.count + 1 }
+        let chunkCount = max(1, Int(ceil(Double(total) / Double(cap))))
+        let target = Int(ceil(Double(total) / Double(chunkCount)))
+
         var chunks: [String] = []
         var current: [String] = []
         var length = 0
-
-        for cue in cues {
-            let line = "[\(cue.index)] \(cue.text)"
-            let cost = line.count + (current.isEmpty ? 0 : 1)  // +1 for the newline
-            if !current.isEmpty, length + cost > cap {
+        for line in lines {
+            let cost = line.count + 1
+            // `cap` stays the hard limit; `target` is the goal we aim to divide by.
+            if !current.isEmpty, length + cost > min(target, cap),
+               chunks.count < chunkCount - 1 {
                 chunks.append(current.joined(separator: "\n"))
                 current = []
                 length = 0
             }
             current.append(line)
-            length += line.count + (current.count > 1 ? 1 : 0)
+            length += cost
         }
         if !current.isEmpty { chunks.append(current.joined(separator: "\n")) }
         return chunks
@@ -92,7 +103,7 @@ struct Transcript: Equatable, Sendable {
     /// Cues in the inclusive index range `from...to`, clamped to what exists.
     /// Empty rather than trapping when the range misses entirely — the indices
     /// come from a language model, so out-of-range is an expected input.
-    func cues(from: Int, to: Int) -> [TranscriptCue] {
+    func cues(from: Int, to: Int) -> [SubtitleCue] {
         guard !cues.isEmpty else { return [] }
         let lo = max(0, min(from, to))
         let hi = min(cues.count - 1, max(from, to))

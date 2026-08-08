@@ -1135,6 +1135,36 @@ final class AppState: ObservableObject {
         return true
     }
 
+    // MARK: - Clip suggestions
+
+    enum ClipSource { case subtitles(SubtitleTranscript) }
+
+    /// The transcript for an item, if one was retained at download time.
+    func transcript(for item: VideoItem) -> SubtitleTranscript? {
+        guard let url = DownloadManager.subtitleFile(for: item.id) else { return nil }
+        return SubtitleTranscript.parse(fileURL: url)
+    }
+
+    /// Why clip-finding isn't available for this item, or nil when it is.
+    func clipSuggestBlocker(for item: VideoItem) -> String? {
+        let availability = ClipSuggester.availability
+        if !availability.usable { return availability.reason }
+        if transcript(for: item) == nil {
+            return "No subtitles were saved for this video. Turn on “Embed subtitles” before downloading."
+        }
+        return nil
+    }
+
+    /// Turn a suggestion into an edit. This is the whole reason suggestions are
+    /// cheap to add: a clip is an EditRecipe with in/out set, so it rides the
+    /// editor and the export queue that already exist.
+    func recipe(for clip: SuggestedClip, basedOn item: VideoItem) -> EditRecipe {
+        var recipe = item.meta.recipe ?? .identity
+        recipe.inPoint = clip.start
+        recipe.outPoint = clip.end
+        return recipe
+    }
+
     /// Filename-safe stem from a video title (temp sources are all "source.mp4").
     private func sanitizedStem(_ title: String) -> String {
         let bad = CharacterSet(charactersIn: "/\\:*?\"<>|")
