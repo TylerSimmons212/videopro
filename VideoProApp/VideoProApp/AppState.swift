@@ -511,6 +511,20 @@ final class AppState: ObservableObject {
     /// ffprobe, then a poster frame from ffmpeg.
     func probeLocal(_ item: VideoItem) {
         guard let path = item.meta.filePath, !item.probing else { return }
+
+        // A cached probe describes the bytes it was taken from, and nothing here
+        // notices when an export or re-encode replaces them. File size is the
+        // cheapest signal that it has gone stale — and it costs one stat() against
+        // a subprocess, so it's worth checking every time rather than trusting the
+        // cache blindly.
+        let attrs = try? FileManager.default.attributesOfItem(atPath: path)
+        let sizeOnDisk = (attrs?[.size] as? NSNumber)?.int64Value
+        if let cached = item.meta.probe, cached.fileSize != nil, cached.fileSize == sizeOnDisk,
+           Self.hasDisplayableThumbnail(item.thumbnail) {
+            item.enriched = true
+            return
+        }
+
         item.probing = true
         Task {
             if let info = await MediaProbe.shared.probe(path: path) {

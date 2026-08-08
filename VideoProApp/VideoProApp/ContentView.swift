@@ -302,6 +302,7 @@ struct LibraryView: View {
     @State private var search = ""
     @State private var status: StatusFilter = .all
     @State private var dropTargeted = false
+    @State private var showInspector = false
     @State private var sort: LibrarySort = .newest
     @State private var selection = Set<UUID>()
     @State private var pendingRemoval: [VideoItem] = []
@@ -394,6 +395,18 @@ struct LibraryView: View {
             Button("Cancel", role: .cancel) { pendingRemoval = [] }
         } message: {
             Text("The downloaded files stay on disk.")
+        }
+        .inspector(isPresented: $showInspector) {
+            inspectorContent
+                .inspectorColumnWidth(min: 260, ideal: 280, max: 340)
+        }
+        // Probing is deferred until something is actually inspected: most rows are
+        // never looked at this closely, and each probe is a subprocess.
+        .onChange(of: selection) { _, _ in
+            if showInspector, selection.count == 1, let item = selectedItems.first,
+               item.meta.probe == nil, item.meta.filePath != nil {
+                state.probeLocal(item)
+            }
         }
         .navigationTitle(title)
         .navigationSubtitle(subtitle)
@@ -522,6 +535,22 @@ struct LibraryView: View {
         }
     }
 
+    @ViewBuilder private var inspectorContent: some View {
+        if selection.count == 1, let item = selectedItems.first {
+            MediaInspectorView(title: item.meta.title,
+                               path: item.meta.filePath,
+                               info: item.meta.probe,
+                               isProbing: item.probing)
+        } else if selection.count > 1 {
+            ContentUnavailableView("\(selection.count) Videos Selected",
+                                   systemImage: "square.stack",
+                                   description: Text("Select a single video to inspect it."))
+        } else {
+            ContentUnavailableView("Nothing Selected", systemImage: "sidebar.right",
+                                   description: Text("Select a video to see its media details."))
+        }
+    }
+
     /// The bar has nothing useful to say when the library is empty, or when a
     /// scope holds too little to be worth filtering — so it stays out entirely
     /// rather than showing a row of dead controls.
@@ -579,6 +608,15 @@ struct LibraryView: View {
         ToolbarItemGroup(placement: .primaryAction) {
             Button { state.chooseFilesToImport() } label: { Image(systemName: "folder.badge.plus") }
                 .help("Import files from your Mac")
+
+            Button {
+                showInspector.toggle()
+                if showInspector, selection.count == 1, let item = selectedItems.first,
+                   item.meta.probe == nil, item.meta.filePath != nil {
+                    state.probeLocal(item)
+                }
+            } label: { Image(systemName: "info.circle") }
+                .help("Media details")
 
             Button { showAddURL.toggle() } label: { Image(systemName: "plus") }
                 .help("Add a video by URL")
@@ -771,7 +809,12 @@ struct VideoRow: View {
                     if let p = item.meta.platform, !p.isEmpty { Pill(text: p, tint: .accentColor) }
                     if let d = item.meta.prettyDuration { Pill(text: d) }
                     if item.meta.height > 0 { Pill(text: "\(item.meta.height)p") }
-                    if let host = URL(string: item.meta.downloadURL)?.host {
+                    // Imported files have no host; the containing folder is the
+                    // equivalent orienting detail.
+                    if item.meta.isLocal, let path = item.meta.importedPath {
+                        Text(URL(fileURLWithPath: path).deletingLastPathComponent().lastPathComponent)
+                            .font(.caption2).foregroundStyle(.tertiary).lineLimit(1)
+                    } else if let host = URL(string: item.meta.downloadURL)?.host {
                         Text(host).font(.caption2).foregroundStyle(.tertiary).lineLimit(1)
                     }
                 }
@@ -901,7 +944,7 @@ struct VideoRow: View {
                     .font(.caption2).foregroundStyle(.tertiary).lineLimit(1)
             }
         case .done:
-            Label("Saved", systemImage: "checkmark.circle.fill")
+            Label(item.meta.isLocal ? "On disk" : "Saved", systemImage: "checkmark.circle.fill")
                 .font(.caption2).foregroundStyle(.green)
         case .error:
             Label(item.statusLine, systemImage: "exclamationmark.triangle.fill")
