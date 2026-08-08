@@ -168,6 +168,9 @@ struct SidebarView: View {
                             .badge(count(.collection(c.id)))
                             .tag(LibraryScope.collection(c.id))
                             .contextMenu {
+                                Button("Join into One Video…") { state.buildCollection(c) }
+                                    .disabled(!state.buildReadiness(c).ready)
+                                Divider()
                                 Button("Rename…") { renaming = c }
                                 Button("Delete Collection", role: .destructive) {
                                     if selection == .collection(c.id) { selection = .inbox }
@@ -630,6 +633,17 @@ struct LibraryView: View {
             }
             .help("Activity")
             .popover(isPresented: $showActivity, arrowEdge: .bottom) { ActivityCenterView() }
+
+            if case .collection(let cid) = scope,
+               let coll = state.collections.first(where: { $0.id == cid }) {
+                let readiness = state.buildReadiness(coll)
+                Button { state.buildCollection(coll) } label: { Image(systemName: "film.stack") }
+                    // The reason lives in the tooltip: a disabled button with no
+                    // explanation is the most annoying kind.
+                    .help(readiness.ready ? "Join \(readiness.reason) into one video"
+                                          : readiness.reason)
+                    .disabled(!readiness.ready)
+            }
 
             if scoped.contains(where: { $0.status == .idle || $0.status == .error }) {
                 Button { for i in visible where i.status == .idle || i.status == .error {

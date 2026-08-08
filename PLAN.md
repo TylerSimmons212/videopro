@@ -156,7 +156,7 @@ gaps, so 0.25× measured 7.5 fps) — an `fps` filter has to close it. And targe
 framing must come *after* rotation, or rotating a 1080x1920 Reel frame yields
 1920x1080 and silently breaks the 9:16 guarantee.
 
-### M6 — Collection builder — **IN PROGRESS**
+### M6 — Collection builder — **DONE**
 
 **The Collection is the sequence** — no separate document model needed.
 
@@ -165,6 +165,13 @@ framing must come *after* rotation, or rotating a 1080x1920 Reel frame yields
 - Constraint: ffmpeg's fast concat path needs identical codec parameters, so
   mixed sources must be normalised first. That's just the M5 export pipeline run
   per clip, which is why this composes rather than becoming an NLE.
+
+Normalisation turned out to be the whole job, and the trap is a clip with **no
+audio track at all**: `-an` leaves a hole with no decodable samples, so every
+segment gets an audio track, synthesising `anullsrc` silence at the spec's layout
+when the source has none. Muting substitutes silence rather than dropping the
+track, for the same reason. Joins are letterboxed rather than cover-cropped — a
+collection is exactly where aspect ratios differ, and lost framing can't be undone.
 
 ### M7 — On-device clip suggestions
 

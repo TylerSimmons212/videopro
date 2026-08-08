@@ -1020,6 +1020,121 @@ final class AppState: ObservableObject {
         return ok
     }
 
+    // MARK: - Collection builder
+
+    /// Can this collection be joined right now?
+    ///
+    /// Every member needs bytes on disk: joining re-encodes each clip to a shared
+    /// spec, and fetching several sources mid-build would turn one job into an
+    /// unbounded queue of network work with no way to report progress honestly.
+    func buildReadiness(_ collection: VideoCollection) -> (ready: Bool, reason: String) {
+        let members = collection.ordering.compactMap { id in items.first { $0.id == id } }
+        if members.isEmpty { return (false, "This collection is empty.") }
+        if members.count < 2 { return (false, "Add at least two videos to join them.") }
+        let missing = members.filter { !hasLocalFile($0) }
+        if !missing.isEmpty {
+            return (false, "\(missing.count) video\(missing.count == 1 ? " isn’t" : "s aren’t") downloaded yet.")
+        }
+        return (true, "\(members.count) videos")
+    }
+
+    /// Join a collection into a single file, in the order the user arranged it.
+    func buildCollection(_ collection: VideoCollection) {
+        let readiness = buildReadiness(collection)
+        guard readiness.ready else {
+            alert("Can’t build “\(collection.name)”", readiness.reason)
+            return
+        }
+        let members = collection.ordering.compactMap { id in items.first { $0.id == id } }
+        JobCenter.shared.enqueue(itemID: collection.id, title: collection.name,
+                                 kind: .buildCollection(collection.name)) { [weak self] job in
+            guard let self else { return false }
+            return await self.runCollectionBuild(collection, members: members, job: job)
+        }
+    }
+
+    private func runCollectionBuild(_ collection: VideoCollection,
+                                    members: [VideoItem], job: Job) async -> Bool {
+        job.progress = 0
+        job.detail = "Reading media…"
+
+        // The spec is derived from what the clips actually are, so every one needs
+        // a probe. Without it derive() falls back to a guess and an unprobed clip
+        // is assumed to have audio — both silently produce a worse join.
+        var clips: [(input: URL, recipe: EditRecipe, source: MediaInfo?)] = []
+        for item in members {
+            guard let path = item.meta.filePath ?? (item.outputPath.isEmpty ? nil : item.outputPath)
+            else { job.detail = "“\(item.meta.title)” has no file."; return false }
+            var info = item.meta.probe
+            if info == nil {
+                info = await MediaProbe.shared.probe(path: path)
+                if let info { item.meta.probe = info }
+            }
+            clips.append((URL(fileURLWithPath: path), item.meta.recipe ?? .identity, info))
+        }
+        saveLibrary()
+
+        let spec = ConcatSpec.derive(from: clips.map(\.source))
+        let out = uniqueURL(in: downloadFolder, name: sanitizedStem(collection.name), ext: "mp4")
+        let plan = CollectionBuildPlan.make(clips: clips, spec: spec, output: out)
+
+        let fm = FileManager.default
+        // A mid-build failure otherwise strands gigabytes of intermediates in
+        // /var/folders, and nothing else ever sweeps them.
+        defer { try? fm.removeItem(at: plan.workingDirectory) }
+
+        do {
+            try fm.createDirectory(at: plan.workingDirectory, withIntermediateDirectories: true)
+            try plan.listFileContents.write(to: plan.listFileURL, atomically: true, encoding: .utf8)
+        } catch {
+            job.detail = "Couldn’t prepare a working folder."
+            return false
+        }
+
+        let totalSteps = Double(plan.segments.count + 1)
+        for segment in plan.segments {
+            job.detail = "Normalising clip \(segment.index + 1) of \(plan.segments.count)…"
+            for args in segment.passes {
+                let ok = await withCheckedContinuation { cont in
+                    let handle = DownloadManager.shared.runFFmpeg(args, item: members[0],
+                                                                  label: job.detail) {
+                        cont.resume(returning: $0)
+                    }
+                    job.onCancel = { handle?.stop() }
+                }
+                guard ok else {
+                    // Name the clip: "clip 3 of 7" is the difference between a
+                    // fixable problem and an opaque one.
+                    job.detail = "Clip \(segment.index + 1) (\(members[segment.index].meta.title)) couldn’t be converted."
+                    return false
+                }
+            }
+            job.progress = Double(segment.index + 1) / totalSteps
+        }
+
+        job.detail = "Joining…"
+        let joined = await withCheckedContinuation { cont in
+            let handle = DownloadManager.shared.runFFmpeg(plan.finalPass, item: members[0],
+                                                          label: "Joining…") {
+                cont.resume(returning: $0)
+            }
+            job.onCancel = { handle?.stop() }
+        }
+        guard joined else { job.detail = "Couldn’t join the clips."; return false }
+
+        job.progress = 1
+        NSWorkspace.shared.activateFileViewerSelecting([plan.outputURL])
+        let content = UNMutableNotificationContent()
+        content.title = "Collection built"
+        content.body = "\(collection.name) · \(plan.segments.count) clips"
+        content.sound = .default
+        // In an async context this resolves to the throwing async overload rather
+        // than the completion-handler one the sync call sites use.
+        try? await UNUserNotificationCenter.current().add(
+            UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil))
+        return true
+    }
+
     /// Filename-safe stem from a video title (temp sources are all "source.mp4").
     private func sanitizedStem(_ title: String) -> String {
         let bad = CharacterSet(charactersIn: "/\\:*?\"<>|")

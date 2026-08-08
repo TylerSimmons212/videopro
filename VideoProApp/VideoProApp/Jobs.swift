@@ -6,6 +6,9 @@ import Combine
 enum JobKind: Equatable, Sendable {
     case download(DownloadQuality)
     case export(ExportTarget)
+    /// Joining a collection into one file. Shares the export lane: it is the same
+    /// CPU-bound ffmpeg work, just N+1 processes instead of one or two.
+    case buildCollection(String)
 
     /// What the user is told this job is. Kept here so a row, a notification and
     /// a log line can never describe the same job differently.
@@ -13,6 +16,7 @@ enum JobKind: Equatable, Sendable {
         switch self {
         case .download(let q): return "Download · \(q.rawValue)"
         case .export(let t):   return "Export · \(t.displayName)"
+        case .buildCollection(let name): return "Build · \(name)"
         }
     }
 
@@ -20,6 +24,7 @@ enum JobKind: Equatable, Sendable {
         switch self {
         case .download: return "arrow.down.circle"
         case .export:   return "square.and.arrow.up.on.square"
+        case .buildCollection: return "film.stack"
         }
     }
 }
@@ -191,6 +196,7 @@ final class JobCenter: ObservableObject {
         switch kind {
         case .download: return .download
         case .export:   return .export
+        case .buildCollection: return .export
         }
     }
 
