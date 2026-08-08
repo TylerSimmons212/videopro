@@ -6,9 +6,52 @@ import Foundation
 final class DownloadManager {
     static let shared = DownloadManager()
 
-    private let ioQueue = DispatchQueue(label: "com.videopro.downloads", attributes: .concurrent)
+    /// Timers only. `asyncAfter` on here costs no thread, so it stays responsive
+    /// even when every probe slot is busy.
+    private let timerQueue = DispatchQueue(label: "com.videopro.timers")
+
+    /// Bounded pool for the blocking probes (`yt-dlp -J`, `yt-dlp -g`, the ffmpeg
+    /// thumbnail grab). Each one parks its thread in `waitUntilExit()`.
+    ///
+    /// This used to be a plain `.concurrent` DispatchQueue, which meant N queued
+    /// probes parked N threads — and AppState fires one probe per un-thumbnailed
+    /// item on launch and one per video added, with no ceiling. Past libdispatch's
+    /// ~64-thread limit the pool is exhausted and *unrelated* queues stop being
+    /// serviced, including the one Foundation delivers `Process.terminationHandler`
+    /// on. A finished download then never reports completion, AppState never
+    /// decrements `activeDownloads`, and once three are stuck the queue is wedged
+    /// for the rest of the session. An OperationQueue runs `max` at a time and
+    /// parks nothing while the rest wait their turn.
+    private let probeQueue: OperationQueue = {
+        let q = OperationQueue()
+        q.maxConcurrentOperationCount = 3
+        q.qualityOfService = .utility
+        return q
+    }()
+
     private var running: [UUID: Process] = [:]
     private let lock = NSLock()
+
+    /// Kill a download that has printed nothing for this long.
+    ///
+    /// yt-dlp retries internally and can spin for a very long time against a CDN
+    /// that has started throttling — which is exactly what happens after a burst
+    /// of downloads. It holds one of AppState's three slots the whole time, so
+    /// without this a stalled transfer is indistinguishable from a permanent hang.
+    static let stallTimeout: TimeInterval = 120
+
+    /// `--cookies-from-browser` argument, or nil when the user hasn't opted in.
+    ///
+    /// Held here rather than threaded through every call site because *all* the
+    /// yt-dlp entry points need it: a members-only video fails to probe for the
+    /// same reason it fails to download. Set by AppState when the setting changes.
+    var cookieSpec: String?
+
+    /// Cookie flags for a yt-dlp invocation, empty when opted out.
+    private var cookieArgs: [String] {
+        guard let cookieSpec else { return [] }
+        return ["--cookies-from-browser", cookieSpec]
+    }
 
     // MARK: - Binary discovery
 
@@ -68,8 +111,14 @@ final class DownloadManager {
             "--no-part",
             "--restrict-filenames",
             "--embed-metadata",
+            // Fail in bounded time rather than retrying forever. Defaults are 10
+            // retries with backoff and no socket timeout, which against a
+            // throttling CDN can stall well past any reasonable wait.
+            "--socket-timeout", "30",
+            "--retries", "5",
+            "--fragment-retries", "5",
             "-o", folder.appendingPathComponent("%(title)s.%(ext)s").path,
-        ]
+        ] + cookieArgs
         if let ff = ffmpegDirectory {
             args += ["--ffmpeg-location", ff]
         }
@@ -84,6 +133,9 @@ final class DownloadManager {
                 args += [
                     "--write-subs", "--write-auto-subs",
                     "--sub-langs", options.subtitleLanguages,
+                    // Pace the subtitle requests: several in quick succession is
+                    // what earns a 429, and a failed subtitle aborts the video too.
+                    "--sleep-subtitles", "1",
                     "--embed-subs", "--convert-subs", "srt",
                 ]
             }
@@ -98,36 +150,76 @@ final class DownloadManager {
         process.standardOutput = pipe
         process.standardError = pipe
 
-        var lastPath = ""
-        var drmBlocked = false
+        // The pipe reader and the termination handler run on different queues, so
+        // everything shared between them lives behind a lock rather than in
+        // captured `var`s.
+        let run = RunState()
         pipe.fileHandleForReading.readabilityHandler = { handle in
             let chunk = handle.availableData
             guard !chunk.isEmpty, let text = String(data: chunk, encoding: .utf8) else { return }
+            run.touch()
             for raw in text.split(whereSeparator: { $0 == "\n" || $0 == "\r" }) {
                 let line = String(raw)
                 if let p = Self.parseProgress(line) {
                     Task { @MainActor in item.apply(progress: p, line: line) }
                 }
                 if let dest = Self.parseDestination(line) {
-                    lastPath = dest
+                    run.note(path: dest)
                 }
                 if line.contains("[DRM]") || line.contains("DRM protection") {
-                    drmBlocked = true
+                    run.noteDRM()
                 }
             }
         }
 
+        // Watchdog: a download that stops producing output is killed so its slot
+        // in AppState's queue is released. Without this a single stalled transfer
+        // is permanent, and three of them stop the app downloading entirely.
+        let watchdog = DispatchSource.makeTimerSource(queue: timerQueue)
+        watchdog.schedule(deadline: .now() + 30, repeating: 30)
+        watchdog.setEventHandler { [weak process] in
+            guard let process, process.isRunning else { return }
+            guard Date().timeIntervalSince(run.lastActivity) > Self.stallTimeout else { return }
+            run.noteStalled()
+            process.terminate()
+            // SIGTERM is a request. If yt-dlp is wedged in a syscall it may not
+            // honour it, and the slot has to come back either way.
+            self.timerQueue.asyncAfter(deadline: .now() + 10) { [weak process] in
+                guard let process, process.isRunning else { return }
+                kill(process.processIdentifier, SIGKILL)
+            }
+        }
+        watchdog.resume()
+
         process.terminationHandler = { [weak self] proc in
+            watchdog.cancel()
+            // Drain whatever the reader hasn't picked up yet. yt-dlp prints
+            // "Merging formats into ..." as its very last line, so without this the
+            // final destination is frequently lost to the race between the process
+            // exiting and the readability handler being scheduled — leaving the item
+            // with an empty outputPath despite a successful download.
+            let tail = pipe.fileHandleForReading.availableData
+            if !tail.isEmpty, let text = String(data: tail, encoding: .utf8) {
+                for raw in text.split(whereSeparator: { $0 == "\n" || $0 == "\r" }) {
+                    if let dest = Self.parseDestination(String(raw)) { run.note(path: dest) }
+                }
+            }
             pipe.fileHandleForReading.readabilityHandler = nil
             self?.forget(id)
             let ok = proc.terminationStatus == 0
-            let path = lastPath
+            let path = run.lastPath
             if ok { Self.cleanupSidecars(mainFile: path) }
+            let stalled = run.stalled
+            let drmBlocked = run.drmBlocked
             Task { @MainActor in
                 if ok {
                     item.markDone(path: path)
                 } else if drmBlocked {
                     item.markError("DRM-protected — can’t be downloaded")
+                } else if stalled {
+                    item.markError("Stalled — no data for \(Int(Self.stallTimeout))s. Try again.")
+                } else if item.statusLine == "Cancelled" {
+                    // cancel() already said so; don't overwrite it with the exit code.
                 } else {
                     item.markError("yt-dlp failed (exit \(proc.terminationStatus))")
                 }
@@ -135,10 +227,13 @@ final class DownloadManager {
             }
         }
 
+        remember(id, process)
         do {
             try process.run()
-            remember(id, process)
         } catch {
+            watchdog.cancel()
+            pipe.fileHandleForReading.readabilityHandler = nil
+            forget(id)
             item.markError("Could not launch yt-dlp: \(error.localizedDescription)")
             completion?(false)
         }
@@ -175,7 +270,7 @@ final class DownloadManager {
             "--newline", "--no-playlist", "--no-part", "--restrict-filenames",
             "-f", format,
             "-o", folder.appendingPathComponent("source.%(ext)s").path,
-        ]
+        ] + cookieArgs
         if let ff = ffmpegDirectory { args += ["--ffmpeg-location", ff] }
         if let range {
             // Section downloads are cut by ffmpeg, so they need it on PATH.
@@ -218,10 +313,12 @@ final class DownloadManager {
             Task { @MainActor in completion(file?.path) }
         }
 
+        remember(id, process)
         do {
             try process.run()
-            remember(id, process)
         } catch {
+            pipe.fileHandleForReading.readabilityHandler = nil
+            forget(id)
             completion(nil)
         }
     }
@@ -242,14 +339,15 @@ final class DownloadManager {
     /// Returns a direct, AVPlayer-friendly URL by asking yt-dlp for it.
     func resolvePlayableURL(for meta: VideoMeta) async -> URL? {
         guard let ytdlp = ytDlpPath else { return nil }
+        let cookies = cookieArgs
         return await withCheckedContinuation { continuation in
-            ioQueue.async {
+            probeQueue.addOperation {
                 let process = Process()
                 process.executableURL = URL(fileURLWithPath: ytdlp)
                 // Prefer a single progressive mp4 so AVPlayer gets one stream.
                 process.arguments = [
                     "-g", "-f", "b[ext=mp4]/b", "--no-playlist", meta.downloadURL,
-                ]
+                ] + cookies
                 let out = Pipe()
                 process.standardOutput = out
                 process.standardError = Pipe()
@@ -267,9 +365,9 @@ final class DownloadManager {
         }
     }
 
-    /// Remove sidecar subtitle files yt-dlp leaves next to the output once subs
-    /// are embedded (e.g. "Title.en.srt", "Title.en-orig.srt"), so the folder
-    /// stays clean.
+    /// Remove the subtitle sidecars yt-dlp leaves next to the output once they're
+    /// embedded ("Title.en.srt", "Title.en-orig.srt"), so the download folder
+    /// stays clean. The subtitles themselves live in the video from here on.
     static func cleanupSidecars(mainFile: String) {
         guard !mainFile.isEmpty else { return }
         let url = URL(fileURLWithPath: mainFile)
@@ -291,11 +389,11 @@ final class DownloadManager {
 
     @MainActor
     func runFFmpeg(_ args: [String], item: VideoItem, label: String,
-                   completion: @escaping @MainActor (Bool) -> Void) {
+                   completion: @escaping @MainActor (Bool) -> Void) -> Cancel? {
         guard let ffmpeg = locate("ffmpeg") else {
             item.markError("ffmpeg not found — bundle it or `brew install ffmpeg`.")
             completion(false)
-            return
+            return nil
         }
         item.busy = true
         item.busyLabel = label
@@ -303,9 +401,22 @@ final class DownloadManager {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: ffmpeg)
         process.arguments = args
-        process.standardOutput = Pipe()
-        process.standardError = Pipe()
+
+        // Both pipes must be drained. ffmpeg writes a progress line to stderr
+        // every half second or so; nobody was reading it, so on a long job the
+        // 64KB pipe buffer filled and ffmpeg blocked on write() forever. The
+        // termination handler then never ran, leaving `item.busy` stuck true —
+        // a permanently spinning row that could never be exported again.
+        let out = Pipe(), err = Pipe()
+        process.standardOutput = out
+        process.standardError = err
+        let sink: @Sendable (FileHandle) -> Void = { _ = $0.availableData }
+        out.fileHandleForReading.readabilityHandler = sink
+        err.fileHandleForReading.readabilityHandler = sink
+
         process.terminationHandler = { proc in
+            out.fileHandleForReading.readabilityHandler = nil
+            err.fileHandleForReading.readabilityHandler = nil
             let ok = proc.terminationStatus == 0
             Task { @MainActor in
                 item.busy = false
@@ -316,10 +427,26 @@ final class DownloadManager {
         do {
             try process.run()
         } catch {
+            out.fileHandleForReading.readabilityHandler = nil
+            err.fileHandleForReading.readabilityHandler = nil
             item.busy = false
             item.busyLabel = ""
             completion(false)
+            return nil
         }
+        // Handing the caller a way to stop this is what makes cancelling an export
+        // mean anything. Exports were previously unregistered entirely, so a
+        // cancelled job settled while ffmpeg carried on burning CPU to completion.
+        return Cancel { [weak process] in
+            guard let process, process.isRunning else { return }
+            process.terminate()
+        }
+    }
+
+    /// A one-shot stop handle for work that isn't tracked in `running` (which is
+    /// keyed by item id and so can't hold two jobs for the same video).
+    struct Cancel {
+        let stop: () -> Void
     }
 
     // MARK: - Generate a thumbnail with ffmpeg
@@ -337,12 +464,24 @@ final class DownloadManager {
     /// blob/DRM/unreachable sources. Best-effort with a hard timeout.
     func generateThumbnail(for meta: VideoMeta, id: UUID, seek: Double = 3) async -> String? {
         guard let ffmpeg = locate("ffmpeg") else { return nil }
-        let src = meta.downloadURL
-        guard src.hasPrefix("http") else { return nil }
+        // An imported file is read straight off disk; only remote sources have to
+        // be an http(s) URL. Anything else (blob:, data:) ffmpeg can't open.
+        let src: String
+        if let local = meta.filePath, FileManager.default.fileExists(atPath: local) {
+            src = local
+        } else if meta.downloadURL.hasPrefix("http") {
+            src = meta.downloadURL
+        } else {
+            return nil
+        }
+        // Seeking past the end yields no frame at all, which is easy to hit on the
+        // short clips people import.
+        var seek = seek
+        if let d = meta.duration, d > 0, seek >= d { seek = max(0, d / 2) }
         let out = Self.thumbsDirectory().appendingPathComponent("\(id.uuidString).jpg")
 
         return await withCheckedContinuation { continuation in
-            ioQueue.async {
+            probeQueue.addOperation {
                 let process = Process()
                 process.executableURL = URL(fileURLWithPath: ffmpeg)
                 process.arguments = [
@@ -366,7 +505,7 @@ final class DownloadManager {
                     continuation.resume(returning: value)
                 }
                 // Hard timeout so a slow/huge source can't hang enrichment.
-                self.ioQueue.asyncAfter(deadline: .now() + 20) {
+                self.timerQueue.asyncAfter(deadline: .now() + 20) {
                     if process.isRunning { process.terminate() }
                 }
                 do {
@@ -390,6 +529,7 @@ final class DownloadManager {
         var duration: Double?
         var heights: [Int]
         var playURL: String?     // a muxed stream AVPlayer can open directly
+        var chapters: [VideoChapter] = []
     }
 
     /// Signed CDN URLs (googlevideo & friends) are time-limited. Trust the URL's
@@ -407,11 +547,12 @@ final class DownloadManager {
     /// distinct heights it offers. Best-effort; nil on failure.
     func fetchInfo(for meta: VideoMeta) async -> VideoInfo? {
         guard let ytdlp = ytDlpPath else { return nil }
+        let cookies = cookieArgs
         return await withCheckedContinuation { continuation in
-            ioQueue.async {
+            probeQueue.addOperation {
                 let process = Process()
                 process.executableURL = URL(fileURLWithPath: ytdlp)
-                process.arguments = ["-J", "--no-playlist", "--no-warnings", meta.downloadURL]
+                process.arguments = ["-J", "--no-playlist", "--no-warnings", meta.downloadURL] + cookies
                 let out = Pipe()
                 process.standardOutput = out
                 process.standardError = Pipe()
@@ -435,12 +576,23 @@ final class DownloadManager {
             if let h = f["height"] as? Int, h > 0 { set.insert(h) }
         }
         if let h = json["height"] as? Int, h > 0 { set.insert(h) }
+        // yt-dlp gives chapters as {start_time, end_time, title}; a video with none
+        // simply omits the key.
+        let chapters: [VideoChapter] = ((json["chapters"] as? [[String: Any]]) ?? [])
+            .compactMap { c in
+                guard let start = c["start_time"] as? Double else { return nil }
+                let title = (c["title"] as? String) ?? ""
+                return VideoChapter(title: title.isEmpty ? "Chapter" : title,
+                                    start: start, end: c["end_time"] as? Double)
+            }
+
         return VideoInfo(
             thumbnail: json["thumbnail"] as? String,
             title: json["title"] as? String,
             duration: json["duration"] as? Double,
             heights: set.sorted(by: >),
-            playURL: pickProgressiveURL(formats: formats, json: json)
+            playURL: pickProgressiveURL(formats: formats, json: json),
+            chapters: chapters
         )
     }
 
@@ -512,4 +664,27 @@ final class DownloadManager {
     private func forget(_ id: UUID) {
         lock.lock(); running[id] = nil; lock.unlock()
     }
+}
+
+/// State shared between a subprocess's pipe reader and its termination handler.
+///
+/// These run on two different queues, so the plain captured `var`s this replaced
+/// were a genuine data race — and one whose practical effect was losing the last
+/// line of output, which is where yt-dlp reports the merged file's path.
+private final class RunState {
+    private let lock = NSLock()
+    private var _lastPath = ""
+    private var _drm = false
+    private var _stalled = false
+    private var _lastActivity = Date()
+
+    var lastPath: String { lock.lock(); defer { lock.unlock() }; return _lastPath }
+    var drmBlocked: Bool { lock.lock(); defer { lock.unlock() }; return _drm }
+    var stalled: Bool { lock.lock(); defer { lock.unlock() }; return _stalled }
+    var lastActivity: Date { lock.lock(); defer { lock.unlock() }; return _lastActivity }
+
+    func note(path: String) { lock.lock(); _lastPath = path; lock.unlock() }
+    func noteDRM() { lock.lock(); _drm = true; lock.unlock() }
+    func noteStalled() { lock.lock(); _stalled = true; lock.unlock() }
+    func touch() { lock.lock(); _lastActivity = Date(); lock.unlock() }
 }

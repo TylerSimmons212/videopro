@@ -76,6 +76,73 @@ struct VideoProApp: App {
             CommandGroup(after: .appInfo) {
                 CheckForUpdatesView(updater: updater)
             }
+            CommandGroup(after: .newItem) {
+                Button("Grab Front Tab") { state.grabFrontTab() }
+                    .keyboardShortcut("g", modifiers: [.command, .shift])
+            }
         }
+
+        // One window per video, opened with `openWindow(value:)` from the library.
+        //
+        // Restoration is off deliberately. `WindowGroup(for:)` persists its value
+        // across launches, which would reopen a player pointing at whatever URL it
+        // had — and for a stream that's a signed CDN link that has since expired.
+        // VideoItem takes the same position on purpose (see `playURL`: "Deliberately
+        // NOT persisted … a stale one from a previous launch would 403"); restoring
+        // here would quietly reintroduce exactly that, as a blank player rather than
+        // an error. Playback is cheap to restart from the library.
+        WindowGroup(for: PlayerContext.self) { $context in
+            PlayerWindowView(context: context)
+        }
+        .defaultSize(width: 900, height: 560)
+        .windowResizability(.contentMinSize)
+        .restorationBehavior(.disabled)
+
+        // ⌘, — preferences belong in a window, not in a toolbar popover.
+        Settings {
+            SettingsView()
+                .environmentObject(state)
+        }
+
+        // The one-off path: grab a video without ever opening the window.
+        MenuBarExtra("VideoPro", systemImage: "arrow.down.circle") {
+            MenuBarContent().environmentObject(state)
+        }
+    }
+}
+
+/// Menu bar contents. Deliberately tiny — this surface exists to make a one-off
+/// grab take one click, not to be a second copy of the app.
+struct MenuBarContent: View {
+    @EnvironmentObject var state: AppState
+
+    var body: some View {
+        // Menus are rebuilt each time they open, so reading this directly picks up
+        // a browser change without needing to observe anything.
+        let frontTab = FrontTab.shared
+        // Naming the browser makes the action predictable — otherwise "Grab Front
+        // Tab" is a coin flip when several browsers are open.
+        Button(frontTab.target.map { "Grab Front Tab from \($0.name)" } ?? "No browser open") {
+            state.grabFrontTab()
+        }
+        .disabled(frontTab.target == nil)
+
+        Button("Paste URL and Download") {
+            let pasted = NSPasteboard.general.string(forType: .string) ?? ""
+            if let item = state.addURL(pasted) { state.download(item) }
+        }
+
+        if state.jobs.activeCount + state.jobs.queuedCount > 0 {
+            Divider()
+            Text("\(state.jobs.activeCount) running, \(state.jobs.queuedCount) queued")
+        }
+
+        Divider()
+        Button("Open VideoPro") {
+            NSApp.activate(ignoringOtherApps: true)
+            NSApp.windows.first { $0.canBecomeMain }?.makeKeyAndOrderFront(nil)
+        }
+        Button("Quit VideoPro") { NSApp.terminate(nil) }
+            .keyboardShortcut("q")
     }
 }

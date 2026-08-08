@@ -21,16 +21,46 @@ final class AppState: ObservableObject {
     /// Persisted so we can distinguish "never set up" from "set up, not open right now".
     @Published var everConnected = false
 
-    // User download preferences.
-    @Published var defaultQuality: DownloadQuality = .bestMP4
-    @Published var embedThumbnail = true
-    @Published var embedSubtitles = true
+    // User download preferences. All persisted — these used to reset to their
+    // defaults on every launch, silently undoing whatever the user chose.
+    @Published var defaultQuality: DownloadQuality = .bestMP4 { didSet { persistPrefs() } }
+    @Published var embedThumbnail = true { didSet { persistPrefs() } }
+    @Published var embedSubtitles = true { didSet { persistPrefs() } }
 
-    // Download queue
-    @Published var activeDownloads = 0
-    @Published var queuedCount = 0
-    private var pending: [(VideoItem, DownloadQuality)] = []
-    let maxConcurrent = 3
+    /// Bundle id of the browser to borrow cookies from, or nil for none.
+    ///
+    /// Off by default and deliberately opt-in: it's what makes logged-in and
+    /// members-only videos work without the extension, but the first use triggers
+    /// a keychain prompt (Chromium) or needs Full Disk Access (Safari), and
+    /// neither is something to spring on someone who didn't ask.
+    @Published var cookieBrowserID: String? {
+        didSet { persistPrefs(); applyCookieSetting() }
+    }
+
+    /// System-wide hotkey for the fast path.
+    @Published var hotKeyEnabled = true { didSet { persistPrefs(); applyHotKey() } }
+
+    /// Whether the loopback server for the browser extension is listening.
+    ///
+    /// Off unless the extension is actually being used. The server has no way to
+    /// tell a request from the extension apart from one forged by any page you
+    /// happen to be visiting — `focus.js` is a content script, so its requests
+    /// carry the *page's* origin, not the extension's. Now that the hotkey and
+    /// menu bar cover the common path without it, the honest default is not to
+    /// listen at all. Turning it on is a deliberate act, tied to extension setup.
+    @Published var serverEnabled = false { didSet { persistPrefs(); applyServerSetting() } }
+
+    /// The combination the fast path listens for. User-changeable, because the
+    /// default can collide with whatever else they've installed.
+    @Published var hotKeyCombo: KeyCombo = .fallback { didSet { persistPrefs(); applyHotKey() } }
+
+    /// Set when the OS refused the chosen combination — another app already owns
+    /// it. Surfaced in Settings; without it a taken shortcut just looks broken.
+    @Published var hotKeyUnavailable = false
+
+    /// Mirrors JobCenter so views observing AppState still repaint when work
+    /// starts or finishes. The queue itself lives in JobCenter now.
+    let jobs = JobCenter.shared
 
     /// How many un-downloaded videos to pre-warm on launch. Each costs one
     /// `yt-dlp -J`, so this is a deliberate ceiling, not the whole library.
@@ -60,6 +90,101 @@ final class AppState: ObservableObject {
             self.downloadFolder = saved
         }
         self.everConnected = UserDefaults.standard.bool(forKey: "everConnected")
+        loadPrefs()   // reads everConnected above for the serverEnabled default
+
+        // Throttled so a burst of transitions coalesces into one re-render.
+        VideoItem.statusChanged
+            .throttle(for: .milliseconds(200), scheduler: RunLoop.main, latest: true)
+            .sink { [weak self] in self?.objectWillChange.send() }
+            .store(in: &bag)
+
+        // `objectWillChange` fires *before* the mutation, so read the counts on the
+        // next runloop turn or the badge is always one event stale.
+        JobCenter.shared.objectWillChange
+            .receive(on: RunLoop.main)
+            .sink { [weak self] in
+                let n = JobCenter.shared.activeCount
+                NSApp.dockTile.badgeLabel = n > 0 ? "\(n)" : ""
+                self?.objectWillChange.send()
+            }
+            .store(in: &bag)
+    }
+
+    private var bag = Set<AnyCancellable>()
+
+    // MARK: - Preferences
+
+    private enum PrefKey {
+        static let quality = "defaultQuality"
+        static let thumb = "embedThumbnail"
+        static let subs = "embedSubtitles"
+        static let cookieBrowser = "cookieBrowserID"
+        static let hotKey = "hotKeyEnabled"
+        static let server = "serverEnabled"
+        static let hotKeyCode = "hotKeyCode"
+        static let hotKeyModifiers = "hotKeyModifiers"
+    }
+
+    private var loadingPrefs = false
+
+    private func loadPrefs() {
+        loadingPrefs = true
+        defer { loadingPrefs = false }
+        let d = UserDefaults.standard
+        if let raw = d.string(forKey: PrefKey.quality),
+           let q = DownloadQuality(rawValue: raw) { defaultQuality = q }
+        if d.object(forKey: PrefKey.thumb) != nil { embedThumbnail = d.bool(forKey: PrefKey.thumb) }
+        if d.object(forKey: PrefKey.subs) != nil { embedSubtitles = d.bool(forKey: PrefKey.subs) }
+        cookieBrowserID = d.string(forKey: PrefKey.cookieBrowser)
+        if d.object(forKey: PrefKey.hotKey) != nil { hotKeyEnabled = d.bool(forKey: PrefKey.hotKey) }
+        // Migration: someone already using the extension must not silently lose it
+        // on update, so an existing connection counts as consent.
+        serverEnabled = d.object(forKey: PrefKey.server) != nil
+            ? d.bool(forKey: PrefKey.server)
+            : everConnected
+        if d.object(forKey: PrefKey.hotKeyCode) != nil,
+           d.object(forKey: PrefKey.hotKeyModifiers) != nil {
+            hotKeyCombo = KeyCombo(keyCode: UInt32(d.integer(forKey: PrefKey.hotKeyCode)),
+                                   modifiers: UInt32(d.integer(forKey: PrefKey.hotKeyModifiers)))
+        }
+        if d.object(forKey: "inboxExpiryDays") != nil {
+            inboxExpiryDays = d.integer(forKey: "inboxExpiryDays")
+        }
+    }
+
+    private func persistPrefs() {
+        guard !loadingPrefs else { return }   // don't echo the load straight back
+        let d = UserDefaults.standard
+        d.set(defaultQuality.rawValue, forKey: PrefKey.quality)
+        d.set(embedThumbnail, forKey: PrefKey.thumb)
+        d.set(embedSubtitles, forKey: PrefKey.subs)
+        d.set(cookieBrowserID, forKey: PrefKey.cookieBrowser)
+        d.set(hotKeyEnabled, forKey: PrefKey.hotKey)
+        d.set(serverEnabled, forKey: PrefKey.server)
+        d.set(Int(hotKeyCombo.keyCode), forKey: PrefKey.hotKeyCode)
+        d.set(Int(hotKeyCombo.modifiers), forKey: PrefKey.hotKeyModifiers)
+    }
+
+    /// The browser cookies are currently being borrowed from, if any.
+    var cookieBrowser: BrowserTarget? {
+        guard let id = cookieBrowserID else { return nil }
+        return BrowserScan.installed().first { $0.id == id }
+    }
+
+    private func applyCookieSetting() {
+        DownloadManager.shared.cookieSpec = cookieBrowser?.cookieSpec
+    }
+
+    private func applyHotKey() {
+        if hotKeyEnabled {
+            let ok = GlobalHotKey.shared.register(hotKeyCombo) { [weak self] in
+                Task { @MainActor in self?.grabFrontTab() }
+            }
+            hotKeyUnavailable = !ok
+        } else {
+            GlobalHotKey.shared.unregister()
+            hotKeyUnavailable = false
+        }
     }
 
     // MARK: - Lifecycle
@@ -67,10 +192,14 @@ final class AppState: ObservableObject {
     func start() {
         clearOwnQuarantineIfNeeded()
         checkInstallLocation()
+        loadCollections()
         loadLibrary()
+        expireInbox()
         refreshTools()
         requestNotifications()
-        startServer()
+        applyServerSetting()
+        applyCookieSetting()
+        applyHotKey()
 
         // Only now is it safe to apply incoming URLs: loadLibrary() replaces
         // `items` wholesale, so anything added before this point would be lost.
@@ -263,6 +392,19 @@ final class AppState: ObservableObject {
         }
     }
 
+    /// Bring the listener in line with the setting.
+    func applyServerSetting() {
+        if serverEnabled {
+            guard server == nil else { return }
+            startServer()
+        } else {
+            server?.stop()
+            server = nil
+            serverRunning = false
+            serverStatus = "Off — not needed unless you use the browser extension"
+        }
+    }
+
     private func startServer() {
         let server = LocalServer(port: port)
         server.onStatus = { [weak self] running, message in
@@ -300,32 +442,288 @@ final class AppState: ObservableObject {
         saveLibrary()
     }
 
+    // MARK: - Fast path
+
+    /// Grab whatever is in the user's browser and start downloading it.
+    ///
+    /// This is the whole point of the app-first rework: hotkey or menu bar item →
+    /// the video is downloading. No window, no paste, no extension. Everything
+    /// this needs is a page URL, which is all yt-dlp ever wanted.
+    func grabFrontTab() {
+        do {
+            let tab = try FrontTab.shared.read()
+            guard let item = addURL(tab.url, title: tab.title) else {
+                notify("Already in your library", tab.title ?? tab.url)
+                return
+            }
+            download(item)
+        } catch let error as FrontTab.Failure {
+            if error.isPermission {
+                // No API can re-prompt once Automation has been denied, so an
+                // alert that routes to Settings is the only way back.
+                let a = NSAlert()
+                a.messageText = error.errorDescription ?? "Permission needed"
+                a.informativeText = "Turn VideoPro on under Privacy & Security → Automation, then try again."
+                a.addButton(withTitle: "Open Settings")
+                a.addButton(withTitle: "Cancel")
+                if a.runModal() == .alertFirstButtonReturn { FrontTab.openAutomationSettings() }
+            } else {
+                notify("Couldn’t grab the tab", error.errorDescription ?? "Unknown error")
+            }
+        } catch {
+            notify("Couldn’t grab the tab", error.localizedDescription)
+        }
+    }
+
+    private func notify(_ title: String, _ body: String) {
+        let content = UNMutableNotificationContent()
+        content.title = title
+        content.body = body
+        let req = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
+        UNUserNotificationCenter.current().add(req)
+    }
+
     /// Add a video by pasting a URL directly into the app (no extension needed).
-    func addURL(_ raw: String) {
+    @discardableResult
+    func addURL(_ raw: String, title: String? = nil) -> VideoItem? {
         var s = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !s.isEmpty else { return }
+        guard !s.isEmpty else { return nil }
         if !s.lowercased().hasPrefix("http") { s = "https://" + s }
         guard let url = URL(string: s), let host = url.host, !host.isEmpty else {
             alert("Invalid URL", "That doesn’t look like a web address.")
-            return
+            return nil
         }
-        if items.contains(where: { $0.meta.downloadURL == s }) { return }
-        let meta = VideoMeta(title: host, pageURL: s, mediaURL: "", sourceKind: "page",
+        if items.contains(where: { $0.meta.downloadURL == s }) { return nil }
+        // The browser's tab title beats the bare host as a placeholder — enrichment
+        // will replace it with the real one shortly either way.
+        let meta = VideoMeta(title: title ?? host, pageURL: s, mediaURL: "", sourceKind: "page",
                              thumbnail: "", duration: nil, width: 0, height: 0, platform: nil)
         let item = VideoItem(meta)
         items.insert(item, at: 0)
         enrich(item)
         saveLibrary()
+        return item
+    }
+
+    // MARK: - Local files
+
+    /// File types worth offering in the open panel / accepting on a drop.
+    static let importableExtensions: Set<String> = [
+        "mp4", "m4v", "mov", "mkv", "webm", "avi", "flv", "wmv", "mpg", "mpeg", "ts", "m2ts",
+        "mp3", "m4a", "aac", "wav", "flac", "aiff", "ogg", "opus",
+    ]
+
+    /// Bring files the user already has into the library.
+    ///
+    /// The file is referenced where it sits — deliberately not copied. Importing
+    /// a 4GB movie should not silently duplicate it, and the user's own folder
+    /// layout is not ours to reorganise.
+    @discardableResult
+    func importFiles(_ urls: [URL]) -> [VideoItem] {
+        var added: [VideoItem] = []
+        for url in urls {
+            guard Self.importableExtensions.contains(url.pathExtension.lowercased()) else { continue }
+            guard FileManager.default.fileExists(atPath: url.path) else { continue }
+            // Same file twice is almost always a mistake rather than intent.
+            if items.contains(where: { $0.meta.importedPath == url.path }) { continue }
+            let item = VideoItem(VideoMeta(importing: url))
+            item.markDone(path: url.path)   // it's already "downloaded" — it's right there
+            items.insert(item, at: 0)
+            added.append(item)
+            probeLocal(item)
+        }
+        if !added.isEmpty { saveLibrary() }
+        return added
+    }
+
+    func chooseFilesToImport() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = true
+        panel.prompt = "Import"
+        panel.message = "Choose video or audio files to add to your library."
+        if panel.runModal() == .OK { importFiles(panel.urls) }
+    }
+
+    /// Fill in what we can read straight off the file: technical detail from
+    /// ffprobe, then a poster frame from ffmpeg.
+    func probeLocal(_ item: VideoItem) {
+        guard let path = item.meta.filePath, !item.probing else { return }
+
+        // A cached probe describes the bytes it was taken from, and nothing here
+        // notices when an export or re-encode replaces them. File size is the
+        // cheapest signal that it has gone stale — and it costs one stat() against
+        // a subprocess, so it's worth checking every time rather than trusting the
+        // cache blindly.
+        let attrs = try? FileManager.default.attributesOfItem(atPath: path)
+        let sizeOnDisk = (attrs?[.size] as? NSNumber)?.int64Value
+        if let cached = item.meta.probe, cached.fileSize != nil, cached.fileSize == sizeOnDisk,
+           Self.hasDisplayableThumbnail(item.thumbnail) {
+            item.enriched = true
+            return
+        }
+
+        item.probing = true
+        Task {
+            if let info = await MediaProbe.shared.probe(path: path) {
+                item.meta.probe = info
+                if let d = info.duration, d > 0 { item.meta.duration = d }
+                if let v = info.video {
+                    item.meta.width = v.width
+                    item.meta.height = v.height
+                    item.availableHeights = v.height > 0 ? [v.height] : []
+                }
+                saveLibrary()
+            }
+            if !Self.hasDisplayableThumbnail(item.thumbnail),
+               let path = await DownloadManager.shared.generateThumbnail(for: item.meta, id: item.id) {
+                item.thumbnail = path
+                item.meta.thumbnail = path
+                saveLibrary()
+            }
+            item.enriched = true
+            item.probing = false
+        }
     }
 
     func remove(_ item: VideoItem) {
         items.removeAll { $0.id == item.id }
+        for idx in collections.indices {
+            collections[idx].ordering.removeAll { $0 == item.id }
+        }
+        // The generated preview frame outlives the entry otherwise; nothing else
+        // ever prunes that directory.
+        let thumb = DownloadManager.thumbsDirectory()
+            .appendingPathComponent("\(item.id.uuidString).jpg")
+        try? FileManager.default.removeItem(at: thumb)
         saveLibrary()
+        saveCollections()
+    }
+
+    /// Batch remove.
+    ///
+    /// Not a loop over `remove(_:)` on purpose: that writes the library and the
+    /// collections file once per item, so removing a selection of thirty would
+    /// mean sixty disk writes and thirty `items` mutations for the list to
+    /// animate through.
+    func remove(_ batch: [VideoItem]) {
+        guard !batch.isEmpty else { return }
+        let ids = Set(batch.map(\.id))
+        items.removeAll { ids.contains($0.id) }
+        for idx in collections.indices {
+            collections[idx].ordering.removeAll { ids.contains($0) }
+        }
+        for id in ids {
+            let thumb = DownloadManager.thumbsDirectory()
+                .appendingPathComponent("\(id.uuidString).jpg")
+            try? FileManager.default.removeItem(at: thumb)
+        }
+        saveLibrary()
+        saveCollections()
     }
 
     func clear() {
-        items.removeAll()
+        remove(items)
+    }
+
+    // MARK: - Tiers & collections
+
+    @Published var collections: [VideoCollection] = []
+
+    /// How long an untouched Inbox entry survives.
+    @Published var inboxExpiryDays = 14 { didSet { UserDefaults.standard.set(inboxExpiryDays, forKey: "inboxExpiryDays") } }
+
+    /// Mark an item as deliberately kept.
+    ///
+    /// Called wherever the user does something that implies intent rather than
+    /// asking them to curate explicitly — that's the whole point of the tier
+    /// split. Downloading is *not* one of those actions: grabbing one video and
+    /// downloading it is exactly the one-off case that should still tidy itself up.
+    func promote(_ item: VideoItem) {
+        guard item.meta.tier != .kept else { return }
+        item.meta.tier = .kept
         saveLibrary()
+    }
+
+    /// Drop stale Inbox entries. **Files on disk are never touched** — this only
+    /// forgets the library row, so a one-off grab leaves nothing to clean up.
+    private func expireInbox() {
+        let cutoff = Date().addingTimeInterval(-Double(inboxExpiryDays) * 86_400)
+        let stale = items.filter {
+            $0.meta.tier == .inbox && !$0.meta.isLocal && $0.meta.receivedAt < cutoff
+                && $0.status != .downloading && $0.status != .queued
+        }
+        guard !stale.isEmpty else { return }
+        let ids = Set(stale.map(\.id))
+        items.removeAll { ids.contains($0.id) }
+        for item in stale {
+            let thumb = DownloadManager.thumbsDirectory()
+                .appendingPathComponent("\(item.id.uuidString).jpg")
+            try? FileManager.default.removeItem(at: thumb)
+        }
+        saveLibrary()
+    }
+
+    @discardableResult
+    func createCollection(named name: String) -> VideoCollection {
+        let c = VideoCollection(name: name)
+        collections.append(c)
+        saveCollections()
+        return c
+    }
+
+    func renameCollection(_ id: UUID, to name: String) {
+        guard let idx = collections.firstIndex(where: { $0.id == id }) else { return }
+        collections[idx].name = name
+        saveCollections()
+    }
+
+    /// Removes the grouping, not the videos — they stay in the library.
+    func deleteCollection(_ id: UUID) {
+        collections.removeAll { $0.id == id }
+        for item in items where item.meta.collectionIDs.contains(id) {
+            item.meta.collectionIDs.removeAll { $0 == id }
+        }
+        saveCollections()
+        saveLibrary()
+    }
+
+    func add(_ item: VideoItem, to collectionID: UUID) {
+        guard let idx = collections.firstIndex(where: { $0.id == collectionID }) else { return }
+        if !collections[idx].ordering.contains(item.id) {
+            collections[idx].ordering.append(item.id)
+        }
+        if !item.meta.collectionIDs.contains(collectionID) {
+            item.meta.collectionIDs.append(collectionID)
+        }
+        promote(item)   // filing something away is intent
+        saveCollections()
+        saveLibrary()
+    }
+
+    func remove(_ item: VideoItem, from collectionID: UUID) {
+        guard let idx = collections.firstIndex(where: { $0.id == collectionID }) else { return }
+        collections[idx].ordering.removeAll { $0 == item.id }
+        item.meta.collectionIDs.removeAll { $0 == collectionID }
+        saveCollections()
+        saveLibrary()
+    }
+
+    private var collectionsURL: URL {
+        libraryURL.deletingLastPathComponent().appendingPathComponent("collections.json")
+    }
+
+    private func saveCollections() {
+        if let data = try? JSONEncoder().encode(collections) {
+            try? data.write(to: collectionsURL, options: .atomic)
+        }
+    }
+
+    private func loadCollections() {
+        guard let data = try? Data(contentsOf: collectionsURL),
+              let list = try? JSONDecoder().decode([VideoCollection].self, from: data) else { return }
+        collections = list
     }
 
     // MARK: - Downloads
@@ -333,11 +731,35 @@ final class AppState: ObservableObject {
     /// Queue a download at the given quality (inherits the global embed toggles).
     /// Runs at most `maxConcurrent` at once; the rest wait their turn.
     func download(_ item: VideoItem, quality: DownloadQuality? = nil) {
+        // Nothing to fetch for a file that's already on disk.
+        guard !item.meta.isLocal else { return }
         guard item.status != .downloading, item.status != .queued else { return }
+        let q = quality ?? defaultQuality
         item.status = .queued
         item.statusLine = "Queued…"
-        pending.append((item, quality ?? defaultQuality))
-        pump()
+
+        JobCenter.shared.enqueue(itemID: item.id, title: item.meta.title,
+                                 kind: .download(q)) { [weak self] job in
+            guard let self else { return false }
+            job.onCancel = { DownloadManager.shared.cancel(item) }
+            try? FileManager.default.createDirectory(at: self.downloadFolder,
+                                                     withIntermediateDirectories: true)
+            var opts = self.options
+            opts.quality = q
+            // Mirrored rather than pushed: DownloadManager already reports into the
+            // item, and keeping it unaware of jobs means the download path has one
+            // owner of progress instead of two that can disagree.
+            let progress = item.$progress.sink { job.progress = $0 }
+            let detail = item.$statusLine.sink { job.detail = $0 }
+            let ok = await withCheckedContinuation { cont in
+                DownloadManager.shared.download(item, into: self.downloadFolder,
+                                                options: opts) { cont.resume(returning: $0) }
+            }
+            progress.cancel()
+            detail.cancel()
+            if ok { self.onDownloadFinished(item) }
+            return ok
+        }
     }
 
     /// Queue every item that isn't already downloaded or in flight.
@@ -348,32 +770,15 @@ final class AppState: ObservableObject {
     }
 
     func cancel(_ item: VideoItem) {
-        // Remove from the pending queue if it hasn't started yet.
-        if let idx = pending.firstIndex(where: { $0.0.id == item.id }) {
-            pending.remove(at: idx)
+        guard let job = JobCenter.shared.active.first(where: { $0.itemID == item.id }) else { return }
+        let wasQueued = job.state == .queued
+        JobCenter.shared.cancel(job)
+        // A queued job's work never ran, so nothing has touched the item — put it
+        // back to idle rather than leaving it looking like a failure.
+        if wasQueued {
             item.status = .idle
             item.statusLine = ""
-            refreshCounts()
-            return
         }
-        DownloadManager.shared.cancel(item)
-    }
-
-    private func pump() {
-        while activeDownloads < maxConcurrent, !pending.isEmpty {
-            let (item, quality) = pending.removeFirst()
-            activeDownloads += 1
-            try? FileManager.default.createDirectory(at: downloadFolder, withIntermediateDirectories: true)
-            var opts = options
-            opts.quality = quality
-            DownloadManager.shared.download(item, into: downloadFolder, options: opts) { [weak self] ok in
-                guard let self else { return }
-                self.activeDownloads = max(0, self.activeDownloads - 1)
-                if ok { self.onDownloadFinished(item) }
-                self.pump()
-            }
-        }
-        refreshCounts()
     }
 
     private func onDownloadFinished(_ item: VideoItem) {
@@ -383,11 +788,6 @@ final class AppState: ObservableObject {
             saveLibrary()
         }
         notifyComplete(item)
-    }
-
-    private func refreshCounts() {
-        queuedCount = pending.count
-        NSApp.dockTile.badgeLabel = activeDownloads > 0 ? "\(activeDownloads)" : ""
     }
 
     // MARK: - Notifications
@@ -408,6 +808,9 @@ final class AppState: ObservableObject {
     /// Fetch a video's real thumbnail + available qualities via yt-dlp. Runs once
     /// per item (on arrival, and on-demand when the download menu opens).
     func enrich(_ item: VideoItem) {
+        // An imported file has no remote source; ffprobe is the right tool, not
+        // yt-dlp, and asking yt-dlp to resolve "" wastes a subprocess per item.
+        if item.meta.isLocal { probeLocal(item); return }
         guard !item.enriched, !item.probing else { return }
         item.probing = true
 
@@ -420,14 +823,28 @@ final class AppState: ObservableObject {
 
         Task {
             if let info = await DownloadManager.shared.fetchInfo(for: item.meta) {
-                // Prefer a real captured frame (data:) from the extension; otherwise
-                // use yt-dlp's thumbnail URL and persist it so we don't refetch.
-                if let thumb = info.thumbnail, !thumb.isEmpty, !item.thumbnail.hasPrefix("data:") {
+                // Take yt-dlp's thumbnail whenever it has one, and persist it so we
+                // don't refetch.
+                //
+                // This used to keep the extension's captured `data:` frame instead.
+                // That frame is grabbed off a <canvas> the moment a <video> reports
+                // readyState >= 2, so it is routinely a partly-painted image — which
+                // renders as a thin bar — and once stored it was never revisited:
+                // this branch skipped it, and hasDisplayableThumbnail() counted any
+                // `data:` string as good, so the ffmpeg fallback below never ran
+                // either. A bad capture was permanent. yt-dlp's thumbnail is also
+                // full-resolution rather than the 160px canvas grab, so preferring it
+                // is the better picture regardless.
+                if let thumb = info.thumbnail, !thumb.isEmpty {
                     item.thumbnail = thumb
                     item.meta.thumbnail = thumb
                     saveLibrary()
                 }
                 item.availableHeights = info.heights
+                if !info.chapters.isEmpty, item.meta.chapters != info.chapters {
+                    item.meta.chapters = info.chapters
+                    saveLibrary()
+                }
 
                 // Backfill a duration the extension couldn't read (MSE/blob players).
                 if item.meta.duration == nil, let d = info.duration, d > 0 {
@@ -458,9 +875,13 @@ final class AppState: ObservableObject {
 
     private static func hasDisplayableThumbnail(_ thumb: String) -> Bool {
         if thumb.isEmpty { return false }
-        if thumb.hasPrefix("data:") || thumb.hasPrefix("http") { return true }
-        // Local file path — only if it still exists.
-        return FileManager.default.fileExists(atPath: thumb)
+        // An http URL is taken on trust — AsyncImage resolves it later.
+        if thumb.hasPrefix("http") { return true }
+        // Everything else we can actually decode right now, so do: a `data:` frame
+        // the extension truncated, or an ffmpeg JPEG that got cut off, both decode
+        // to a partial image. Treat those as missing so the ffmpeg fallback below
+        // gets a chance to replace them.
+        return ThumbView.localImage(thumb) != nil
     }
 
     /// Back-compat alias used by the download menu.
@@ -488,13 +909,15 @@ final class AppState: ObservableObject {
 
     /// True when we already hold the bytes locally — the export is then instant.
     func hasLocalFile(_ item: VideoItem) -> Bool {
-        !item.outputPath.isEmpty && FileManager.default.fileExists(atPath: item.outputPath)
+        guard let path = item.meta.filePath ?? (item.outputPath.isEmpty ? nil : item.outputPath)
+        else { return false }
+        return FileManager.default.fileExists(atPath: path)
     }
 
     /// True when we can export at all: either we have the file, or we know where
     /// to get it. Downloading first is *not* a prerequisite.
     func canExport(_ item: VideoItem) -> Bool {
-        hasLocalFile(item) || !item.meta.downloadURL.isEmpty
+        hasLocalFile(item) || !item.meta.downloadURL.isEmpty || item.meta.isLocal
     }
 
     /// Export a clip, GIF, or MP3. Works whether or not the video has been
@@ -502,87 +925,238 @@ final class AppState: ObservableObject {
     /// needs (just the requested section for a clip/GIF, audio-only for MP3)
     /// into a temp dir, convert, then throw the temp away.
     /// `start`/`end` are in seconds; a non-positive `end` means "whole file".
-    func export(_ item: VideoItem, kind: ExportKind, start: Double, end: Double) {
-        // Already downloaded → cut straight from disk, no network at all.
-        if hasLocalFile(item) {
-            let input = URL(fileURLWithPath: item.outputPath)
-            runExport(item, kind: kind, input: input,
-                      outputDir: input.deletingLastPathComponent(),
-                      start: start, end: end, preSliced: false, cleanup: nil)
-            return
-        }
-
-        guard !item.meta.downloadURL.isEmpty else {
+    /// Export `item` through `recipe` to `target`.
+    ///
+    /// The recipe is persisted rather than applied — the source is never modified,
+    /// so the same edit can be re-exported to several targets later.
+    func export(_ item: VideoItem, recipe: EditRecipe, target: ExportTarget) {
+        guard hasLocalFile(item) || !item.meta.downloadURL.isEmpty else {
             alert("Nothing to export", "VideoPro doesn’t have a source URL for this video.")
             return
         }
-
-        let hasRange = kind.usesTimeRange && end > start && start >= 0
-        // MP3 needs no video track — grabbing audio-only saves a lot of bandwidth.
-        let format = (kind == .audio ? DownloadQuality.audioMP3 : DownloadQuality.bestMP4).format
-
-        item.busy = true
-        item.busyLabel = "Fetching source…"
-        let temp = FileManager.default.temporaryDirectory
-            .appendingPathComponent("VideoPro-export-\(item.id.uuidString)", isDirectory: true)
-
-        DownloadManager.shared.fetchSource(item, format: format,
-                                           range: hasRange ? (start, end) : nil,
-                                           into: temp) { [weak self] path in
-            guard let self else { return }
-            guard let path else {
-                item.busy = false
-                item.busyLabel = ""
-                try? FileManager.default.removeItem(at: temp)
-                self.alert("Couldn’t fetch this video",
-                           "VideoPro couldn’t retrieve a source to export from. DRM-protected videos can’t be exported.")
-                return
-            }
-            // yt-dlp already cut the section for us — don't cut it twice.
-            self.runExport(item, kind: kind, input: URL(fileURLWithPath: path),
-                           outputDir: self.downloadFolder,
-                           start: start, end: end, preSliced: hasRange, cleanup: temp)
+        if item.meta.recipe != recipe {
+            item.meta.recipe = recipe
+            promote(item)        // editing is intent
+            saveLibrary()
+        }
+        JobCenter.shared.enqueue(itemID: item.id, title: item.meta.title,
+                                 kind: .export(target)) { [weak self] job in
+            guard let self else { return false }
+            return await self.runExportJob(item, recipe: recipe, target: target, job: job)
         }
     }
 
-    /// The ffmpeg half of an export, shared by the local and fetched paths.
-    private func runExport(_ item: VideoItem, kind: ExportKind, input: URL, outputDir: URL,
-                           start: Double, end: Double, preSliced: Bool, cleanup: URL?) {
-        let stem = preSliced || input.lastPathComponent.hasPrefix("source.")
-            ? sanitizedStem(item.meta.title)
-            : input.deletingPathExtension().lastPathComponent
-        let out = uniqueURL(in: outputDir, name: stem + kind.suffix, ext: kind.fileExtension)
+    /// Fetch-if-needed, then run the plan's passes in order, as ONE job.
+    ///
+    /// Both halves share a job so the export lane genuinely serialises the
+    /// CPU-bound work — splitting them would let several ffmpeg encodes start the
+    /// moment their fetches happened to finish together, which is slower than
+    /// running them in sequence.
+    private func runExportJob(_ item: VideoItem, recipe: EditRecipe,
+                              target: ExportTarget, job: Job) async -> Bool {
+        // ffmpeg's progress output isn't parsed today, so the bar stays honest
+        // about not knowing rather than inventing a number.
+        job.progress = -1
 
-        // If the source was fetched pre-sliced, it *is* the clip already — applying
-        // the range again would cut a range out of a range.
-        let hasRange = !preSliced && kind.usesTimeRange && end > start && start >= 0
-        let dur = end - start
+        var effective = recipe
+        var input: URL
+        var outputDir: URL
+        var cleanup: URL?
 
-        var args = ["-y"]
-        if hasRange { args += ["-ss", String(start)] }
-        args += ["-i", input.path]
-        if hasRange { args += ["-t", String(dur)] }
+        if hasLocalFile(item), let path = item.meta.filePath ?? (item.outputPath.isEmpty ? nil : item.outputPath) {
+            input = URL(fileURLWithPath: path)
+            outputDir = input.deletingLastPathComponent()
+        } else {
+            job.detail = "Fetching source…"
+            let hasRange = recipe.inPoint != nil || recipe.outPoint != nil
+            let range = hasRange ? (recipe.inPoint ?? 0, recipe.outPoint ?? .greatestFiniteMagnitude) : nil
+            let format = (target == .audioMP3 ? DownloadQuality.audioMP3 : DownloadQuality.bestMP4).format
+            let temp = FileManager.default.temporaryDirectory
+                .appendingPathComponent("VideoPro-export-\(item.id.uuidString)", isDirectory: true)
+            job.onCancel = { DownloadManager.shared.cancel(item) }
 
-        switch kind {
-        case .trim:
-            args += ["-c", "copy", "-avoid_negative_ts", "make_zero"]
-        case .gif:
-            args += ["-vf", "fps=12,scale=480:-1:flags=lanczos", "-loop", "0"]
-        case .audio:
-            args += ["-vn", "-c:a", "libmp3lame", "-q:a", "2"]
-        }
-        args.append(out.path)
-
-        DownloadManager.shared.runFFmpeg(args, item: item, label: "Exporting \(kind.rawValue)…") { [weak self] ok in
-            guard let self else { return }
-            if let cleanup { try? FileManager.default.removeItem(at: cleanup) }
-            if ok {
-                NSWorkspace.shared.activateFileViewerSelecting([out])
-                self.notifyExportDone(item, kind: kind)
-            } else {
-                self.alert("Export failed", "ffmpeg couldn’t process this file.")
+            let fetched: String? = await withCheckedContinuation { cont in
+                DownloadManager.shared.fetchSource(item, format: format, range: range,
+                                                   into: temp) { cont.resume(returning: $0) }
+            }
+            guard let fetched else {
+                try? FileManager.default.removeItem(at: temp)
+                job.detail = "Couldn’t fetch a source. DRM-protected videos can’t be exported."
+                return false
+            }
+            input = URL(fileURLWithPath: fetched)
+            outputDir = downloadFolder
+            cleanup = temp
+            // yt-dlp already cut the section, so drop ONLY the trim from the recipe.
+            // Zeroing the whole thing here would silently discard crop, rotation,
+            // speed and scale — everything else the user asked for.
+            if hasRange {
+                effective.inPoint = nil
+                effective.outPoint = nil
             }
         }
+
+        // The planner needs real dimensions to turn a normalised crop into pixels,
+        // and the source bitrate to size a two-pass encode.
+        var source = item.meta.probe
+        if source == nil, effective.crop != nil || target.isSizeTargeted {
+            source = await MediaProbe.shared.probe(path: input.path)
+        }
+
+        let stem = input.lastPathComponent.hasPrefix("source.")
+            ? sanitizedStem(item.meta.title)
+            : input.deletingPathExtension().lastPathComponent
+        let out = uniqueURL(in: outputDir, name: stem + "_edit", ext: target.fileExtension)
+
+        let plan = ExportPlan.make(input: input, output: out, recipe: effective,
+                                   target: target, source: source)
+
+        var ok = true
+        for (index, args) in plan.passes.enumerated() {
+            job.detail = plan.passes.count > 1
+                ? "Exporting \(target.displayName)… (pass \(index + 1) of \(plan.passes.count))"
+                : "Exporting \(target.displayName)…"
+            ok = await withCheckedContinuation { cont in
+                let handle = DownloadManager.shared.runFFmpeg(args, item: item,
+                                                              label: job.detail) {
+                    cont.resume(returning: $0)
+                }
+                job.onCancel = { handle?.stop() }
+            }
+            // Fail fast: a failed pass invalidates everything after it, and pass 2
+            // of a two-pass encode reads statistics pass 1 never wrote.
+            if !ok { break }
+        }
+
+        // Always clear the scratch: a surviving x264 pass log would be picked up by
+        // the *next* export and target a bitrate computed for a different clip.
+        for scratch in plan.scratchFiles { try? FileManager.default.removeItem(at: scratch) }
+        if let cleanup { try? FileManager.default.removeItem(at: cleanup) }
+
+        if ok {
+            NSWorkspace.shared.activateFileViewerSelecting([plan.outputURL])
+            notifyExportDone(item, target: target)
+        } else {
+            // No modal: the failure is in the Activity popover with a Retry button,
+            // and a modal for background work interrupts whatever the user moved on to.
+            job.detail = "ffmpeg couldn’t process this file."
+        }
+        return ok
+    }
+
+    // MARK: - Collection builder
+
+    /// Can this collection be joined right now?
+    ///
+    /// Every member needs bytes on disk: joining re-encodes each clip to a shared
+    /// spec, and fetching several sources mid-build would turn one job into an
+    /// unbounded queue of network work with no way to report progress honestly.
+    func buildReadiness(_ collection: VideoCollection) -> (ready: Bool, reason: String) {
+        let members = collection.ordering.compactMap { id in items.first { $0.id == id } }
+        if members.isEmpty { return (false, "This collection is empty.") }
+        if members.count < 2 { return (false, "Add at least two videos to join them.") }
+        let missing = members.filter { !hasLocalFile($0) }
+        if !missing.isEmpty {
+            return (false, "\(missing.count) video\(missing.count == 1 ? " isn’t" : "s aren’t") downloaded yet.")
+        }
+        return (true, "\(members.count) videos")
+    }
+
+    /// Join a collection into a single file, in the order the user arranged it.
+    func buildCollection(_ collection: VideoCollection) {
+        let readiness = buildReadiness(collection)
+        guard readiness.ready else {
+            alert("Can’t build “\(collection.name)”", readiness.reason)
+            return
+        }
+        let members = collection.ordering.compactMap { id in items.first { $0.id == id } }
+        JobCenter.shared.enqueue(itemID: collection.id, title: collection.name,
+                                 kind: .buildCollection(collection.name)) { [weak self] job in
+            guard let self else { return false }
+            return await self.runCollectionBuild(collection, members: members, job: job)
+        }
+    }
+
+    private func runCollectionBuild(_ collection: VideoCollection,
+                                    members: [VideoItem], job: Job) async -> Bool {
+        job.progress = 0
+        job.detail = "Reading media…"
+
+        // The spec is derived from what the clips actually are, so every one needs
+        // a probe. Without it derive() falls back to a guess and an unprobed clip
+        // is assumed to have audio — both silently produce a worse join.
+        var clips: [(input: URL, recipe: EditRecipe, source: MediaInfo?)] = []
+        for item in members {
+            guard let path = item.meta.filePath ?? (item.outputPath.isEmpty ? nil : item.outputPath)
+            else { job.detail = "“\(item.meta.title)” has no file."; return false }
+            var info = item.meta.probe
+            if info == nil {
+                info = await MediaProbe.shared.probe(path: path)
+                if let info { item.meta.probe = info }
+            }
+            clips.append((URL(fileURLWithPath: path), item.meta.recipe ?? .identity, info))
+        }
+        saveLibrary()
+
+        let spec = ConcatSpec.derive(from: clips.map(\.source))
+        let out = uniqueURL(in: downloadFolder, name: sanitizedStem(collection.name), ext: "mp4")
+        let plan = CollectionBuildPlan.make(clips: clips, spec: spec, output: out)
+
+        let fm = FileManager.default
+        // A mid-build failure otherwise strands gigabytes of intermediates in
+        // /var/folders, and nothing else ever sweeps them.
+        defer { try? fm.removeItem(at: plan.workingDirectory) }
+
+        do {
+            try fm.createDirectory(at: plan.workingDirectory, withIntermediateDirectories: true)
+            try plan.listFileContents.write(to: plan.listFileURL, atomically: true, encoding: .utf8)
+        } catch {
+            job.detail = "Couldn’t prepare a working folder."
+            return false
+        }
+
+        let totalSteps = Double(plan.segments.count + 1)
+        for segment in plan.segments {
+            job.detail = "Normalising clip \(segment.index + 1) of \(plan.segments.count)…"
+            for args in segment.passes {
+                let ok = await withCheckedContinuation { cont in
+                    let handle = DownloadManager.shared.runFFmpeg(args, item: members[0],
+                                                                  label: job.detail) {
+                        cont.resume(returning: $0)
+                    }
+                    job.onCancel = { handle?.stop() }
+                }
+                guard ok else {
+                    // Name the clip: "clip 3 of 7" is the difference between a
+                    // fixable problem and an opaque one.
+                    job.detail = "Clip \(segment.index + 1) (\(members[segment.index].meta.title)) couldn’t be converted."
+                    return false
+                }
+            }
+            job.progress = Double(segment.index + 1) / totalSteps
+        }
+
+        job.detail = "Joining…"
+        let joined = await withCheckedContinuation { cont in
+            let handle = DownloadManager.shared.runFFmpeg(plan.finalPass, item: members[0],
+                                                          label: "Joining…") {
+                cont.resume(returning: $0)
+            }
+            job.onCancel = { handle?.stop() }
+        }
+        guard joined else { job.detail = "Couldn’t join the clips."; return false }
+
+        job.progress = 1
+        NSWorkspace.shared.activateFileViewerSelecting([plan.outputURL])
+        let content = UNMutableNotificationContent()
+        content.title = "Collection built"
+        content.body = "\(collection.name) · \(plan.segments.count) clips"
+        content.sound = .default
+        // In an async context this resolves to the throwing async overload rather
+        // than the completion-handler one the sync call sites use.
+        try? await UNUserNotificationCenter.current().add(
+            UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil))
+        return true
     }
 
     /// Filename-safe stem from a video title (temp sources are all "source.mp4").
@@ -604,10 +1178,10 @@ final class AppState: ObservableObject {
         return candidate
     }
 
-    private func notifyExportDone(_ item: VideoItem, kind: ExportKind) {
+    private func notifyExportDone(_ item: VideoItem, target: ExportTarget) {
         let content = UNMutableNotificationContent()
         content.title = "Export complete"
-        content.body = "\(kind.rawValue) · \(item.meta.title)"
+        content.body = "\(target.displayName) · \(item.meta.title)"
         content.sound = .default
         let req = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
         UNUserNotificationCenter.current().add(req)
@@ -660,6 +1234,8 @@ final class AppState: ObservableObject {
     /// folder path, reveal it in Finder, and deep-link the browser straight to
     /// its extensions page.
     func setUpExtension(in browser: BrowserTarget) {
+        // Setting the extension up is the consent: it cannot reach us otherwise.
+        serverEnabled = true
         guard browser.kind == .chromium else {
             openSafariExtensionSettings()
             return
@@ -707,6 +1283,9 @@ final class AppState: ObservableObject {
     /// path that does work here — loading the unpacked folder via Develop → Add
     /// Temporary Extension.
     func openSafariExtensionSettings() {
+        // Safari reaches us over the videopro:// scheme rather than the port, but
+        // enable it anyway so the two browsers behave the same.
+        serverEnabled = true
         SFSafariApplication.showPreferencesForExtension(withIdentifier: "com.videopro.app.safari") { [weak self] error in
             guard error != nil else { return }
             Task { @MainActor in self?.safariFallback() }
@@ -757,7 +1336,12 @@ final class AppState: ObservableObject {
         return base.appendingPathComponent("library.json")
     }
 
+    /// Set when the library file exists but wouldn't parse. Blocks every write
+    /// from that point on — see loadLibrary() for why that matters.
+    private var libraryLoadFailed = false
+
     private func saveLibrary() {
+        guard !libraryLoadFailed else { return }
         let metas = items.map(\.meta)
         if let data = try? JSONEncoder().encode(metas) {
             try? data.write(to: libraryURL, options: .atomic)
@@ -765,8 +1349,25 @@ final class AppState: ObservableObject {
     }
 
     private func loadLibrary() {
-        guard let data = try? Data(contentsOf: libraryURL),
-              let metas = try? JSONDecoder().decode([VideoMeta].self, from: data) else { return }
+        guard let data = try? Data(contentsOf: libraryURL) else { return }
+        let metas: [VideoMeta]
+        do {
+            metas = try JSONDecoder().decode([VideoMeta].self, from: data)
+        } catch {
+            // A decode failure used to be indistinguishable from an empty library:
+            // `items` stayed empty and the very next saveLibrary() overwrote the
+            // file with `[]`, destroying it. Any schema change makes that a live
+            // risk, so keep a copy and refuse to write until it's sorted out.
+            let backup = libraryURL.deletingLastPathComponent()
+                .appendingPathComponent("library.unreadable-\(Int(Date().timeIntervalSince1970)).json")
+            try? FileManager.default.copyItem(at: libraryURL, to: backup)
+            libraryLoadFailed = true
+            NSLog("VideoPro: could not read library (%@). Backed up to %@; writes disabled.",
+                  error.localizedDescription, backup.path)
+            alert("Couldn’t open your library",
+                  "VideoPro couldn’t read its library file, so it won’t overwrite it. A copy is at:\n\n\(backup.path)")
+            return
+        }
         items = metas.map { VideoItem($0) }
         for item in items {
             // Restore "downloaded" state if the file is still on disk. markDone

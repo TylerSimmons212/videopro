@@ -1,34 +1,116 @@
 import SwiftUI
 import AVKit
 import Combine
+import ImageIO
 
-// MARK: - Library sections
+// MARK: - Library scopes
 
-/// Sidebar sections. Filtering by state is the main thing a download manager has
-/// to do well once you have more than a handful of videos.
-enum LibrarySection: String, CaseIterable, Identifiable, Hashable {
-    case all         = "All Videos"
-    case downloading = "Downloading"
-    case completed   = "Completed"
-    case failed      = "Failed"
+/// What the sidebar selects.
+///
+/// These are *scopes* — genuinely different sets of videos. The old sidebar held
+/// All / Downloading / Completed / Failed, which were one list with a `where`
+/// clause on status; you saw all of it under All Videos anyway. Status is a
+/// transient property of an item, so it belongs in a filter, not in navigation.
+enum LibraryScope: Hashable, Identifiable {
+    case inbox
+    case all
+    case collection(UUID)
+    case smart(SmartFilter)
+    case local
 
-    var id: String { rawValue }
+    var id: String {
+        switch self {
+        case .inbox: return "inbox"
+        case .all: return "all"
+        case .collection(let id): return "c-\(id.uuidString)"
+        case .smart(let f): return "s-\(f.rawValue)"
+        case .local: return "local"
+        }
+    }
 
     var systemImage: String {
         switch self {
-        case .all:         return "square.stack"
-        case .downloading: return "arrow.down.circle"
-        case .completed:   return "checkmark.circle"
-        case .failed:      return "exclamationmark.triangle"
+        case .inbox: return "tray"
+        case .all: return "square.stack"
+        case .collection: return "folder"
+        case .smart(let f): return f.systemImage
+        case .local: return "internaldrive"
         }
     }
 
     func matches(_ item: VideoItem) -> Bool {
         switch self {
-        case .all:         return true
+        case .inbox: return item.meta.tier == .inbox
+        case .all: return true
+        case .collection(let id): return item.meta.collectionIDs.contains(id)
+        case .smart(let f): return f.matches(item)
+        case .local: return item.meta.isLocal
+        }
+    }
+}
+
+/// Saved filters for things the status chips can't express.
+enum SmartFilter: String, CaseIterable, Identifiable, Hashable {
+    case highRes = "High Resolution"
+    case long    = "Over 10 Minutes"
+    case kept    = "Kept"
+
+    var id: String { rawValue }
+
+    var systemImage: String {
+        switch self {
+        case .highRes: return "4k.tv"
+        case .long:    return "clock.arrow.circlepath"
+        case .kept:    return "pin"
+        }
+    }
+
+    func matches(_ item: VideoItem) -> Bool {
+        switch self {
+        case .highRes:
+            return max(item.meta.height, item.availableHeights.max() ?? 0) >= 1440
+        case .long:
+            return (item.meta.duration ?? 0) > 600
+        case .kept:
+            return item.meta.tier == .kept
+        }
+    }
+}
+
+/// Transient state, so: a filter, not a destination.
+enum StatusFilter: String, CaseIterable, Identifiable {
+    case all = "All"
+    case downloading = "Active"
+    case done = "Saved"
+    case failed = "Failed"
+
+    var id: String { rawValue }
+
+    func matches(_ item: VideoItem) -> Bool {
+        switch self {
+        case .all: return true
         case .downloading: return item.status == .downloading || item.status == .queued
-        case .completed:   return item.status == .done
-        case .failed:      return item.status == .error
+        case .done: return item.status == .done
+        case .failed: return item.status == .error
+        }
+    }
+}
+
+enum LibrarySort: String, CaseIterable, Identifiable {
+    case newest = "Newest"
+    case oldest = "Oldest"
+    case title = "Title"
+    case longest = "Longest"
+
+    var id: String { rawValue }
+
+    func apply(_ list: [VideoItem]) -> [VideoItem] {
+        switch self {
+        case .newest: return list.sorted { $0.meta.receivedAt > $1.meta.receivedAt }
+        case .oldest: return list.sorted { $0.meta.receivedAt < $1.meta.receivedAt }
+        case .title: return list.sorted {
+            $0.meta.title.localizedCaseInsensitiveCompare($1.meta.title) == .orderedAscending }
+        case .longest: return list.sorted { ($0.meta.duration ?? 0) > ($1.meta.duration ?? 0) }
         }
     }
 }
@@ -37,16 +119,16 @@ enum LibrarySection: String, CaseIterable, Identifiable, Hashable {
 
 struct ContentView: View {
     @EnvironmentObject var state: AppState
-    @State private var section: LibrarySection = .all
+    @State private var scope: LibraryScope = .inbox
     @AppStorage("vp.hasOnboarded") private var hasOnboarded = false
     @State private var showOnboarding = false
 
     var body: some View {
         NavigationSplitView {
-            SidebarView(selection: $section)
+            SidebarView(selection: $scope)
                 .navigationSplitViewColumnWidth(min: 188, ideal: 208, max: 260)
         } detail: {
-            LibraryView(section: section)
+            LibraryView(scope: scope)
         }
         .onAppear { if !hasOnboarded { showOnboarding = true } }
         .sheet(isPresented: $showOnboarding) {
@@ -60,34 +142,113 @@ struct ContentView: View {
 
 struct SidebarView: View {
     @EnvironmentObject var state: AppState
-    @Binding var selection: LibrarySection
+    @Binding var selection: LibraryScope
+    @State private var newCollectionName = ""
+    @State private var showNewCollection = false
+    @State private var renaming: VideoCollection?
 
     var body: some View {
         List(selection: $selection) {
             Section("Library") {
-                ForEach(LibrarySection.allCases) { s in
-                    Label(s.rawValue, systemImage: s.systemImage)
-                        .badge(count(s))
-                        .tag(s)
+                row(.inbox, "Inbox")
+                row(.all, "All Videos")
+                // Only worth a row once the user has actually imported something;
+                // a downloader-only user should never wonder what it means.
+                if state.items.contains(where: { $0.meta.isLocal }) {
+                    row(.local, "Local Files")
+                }
+            }
+
+            // Stays hidden until one exists — a new user should never meet an
+            // empty "Collections" header asking to be filled in.
+            if !state.collections.isEmpty {
+                Section("Collections") {
+                    ForEach(state.collections) { c in
+                        Label(c.name, systemImage: "folder")
+                            .badge(count(.collection(c.id)))
+                            .tag(LibraryScope.collection(c.id))
+                            .contextMenu {
+                                Button("Join into One Video…") { state.buildCollection(c) }
+                                    .disabled(!state.buildReadiness(c).ready)
+                                Divider()
+                                Button("Rename…") { renaming = c }
+                                Button("Delete Collection", role: .destructive) {
+                                    if selection == .collection(c.id) { selection = .inbox }
+                                    state.deleteCollection(c.id)
+                                }
+                            }
+                    }
+                }
+            }
+
+            Section("Smart") {
+                ForEach(SmartFilter.allCases) { f in
+                    row(.smart(f), f.rawValue)
                 }
             }
         }
         .listStyle(.sidebar)
-        // Status belongs down here, out of the toolbar — it's ambient, not an action.
-        .safeAreaInset(edge: .bottom) { statusFooter }
+        .safeAreaInset(edge: .bottom) { footer }
+        .sheet(item: $renaming) { c in RenameSheet(collection: c).environmentObject(state) }
     }
 
-    private func count(_ s: LibrarySection) -> Int {
-        state.items.filter(s.matches).count
+    private func row(_ scope: LibraryScope, _ title: String) -> some View {
+        Label(title, systemImage: scope.systemImage)
+            .badge(count(scope))
+            .tag(scope)
     }
 
-    private var statusFooter: some View {
+    private func count(_ scope: LibraryScope) -> Int {
+        state.items.filter(scope.matches).count
+    }
+
+    private var newCollectionForm: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("New Collection").font(.subheadline).fontWeight(.semibold)
+            TextField("Name", text: $newCollectionName)
+                .textFieldStyle(.roundedBorder).frame(width: 200)
+                .onSubmit(commitNewCollection)
+            HStack {
+                Spacer()
+                Button("Create", action: commitNewCollection)
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(newCollectionName.trimmingCharacters(in: .whitespaces).isEmpty)
+            }
+        }
+        .padding(14)
+    }
+
+    private func commitNewCollection() {
+        let name = newCollectionName.trimmingCharacters(in: .whitespaces)
+        guard !name.isEmpty else { return }
+        let c = state.createCollection(named: name)
+        newCollectionName = ""
+        showNewCollection = false
+        selection = .collection(c.id)
+    }
+
+    private var footer: some View {
         VStack(alignment: .leading, spacing: 6) {
             Divider()
-            statusLine(ok: state.serverRunning,
-                       text: state.serverRunning ? "Listening" : "Inactive")
-            statusLine(ok: state.extensionStatus.connected,
-                       text: state.extensionStatus.connected ? "Extension connected" : "No extension")
+            Button {
+                showNewCollection = true
+            } label: {
+                Label("New Collection", systemImage: "plus").font(.caption)
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(.secondary)
+            // Anchored to the button rather than to the List, which is what made
+            // it surface in a seemingly arbitrary spot.
+            .popover(isPresented: $showNewCollection, arrowEdge: .trailing) {
+                newCollectionForm
+            }
+
+            // No "Ready" badge: a permanent green dot confirming the normal case
+            // is noise. Only the broken case is worth the space, and only because
+            // every download will fail until it's fixed.
+            if !state.toolsReady {
+                statusLine(ok: false, text: "yt-dlp missing")
+            }
         }
         .padding(.horizontal, 12)
         .padding(.bottom, 10)
@@ -96,13 +257,37 @@ struct SidebarView: View {
     private func statusLine(ok: Bool, text: String) -> some View {
         HStack(spacing: 6) {
             Circle()
-                .fill(ok ? Color.green : Color.secondary.opacity(0.45))
+                .fill(ok ? Color.green : Color.orange)
                 .frame(width: 6, height: 6)
-            Text(text)
-                .font(.caption2)
-                .foregroundStyle(.secondary)
-                .lineLimit(1)
+            Text(text).font(.caption2).foregroundStyle(.secondary).lineLimit(1)
         }
+    }
+}
+
+struct RenameSheet: View {
+    @EnvironmentObject var state: AppState
+    let collection: VideoCollection
+    @Environment(\.dismiss) private var dismiss
+    @State private var name = ""
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Rename Collection").font(.headline)
+            TextField("Name", text: $name).textFieldStyle(.roundedBorder).frame(width: 240)
+            HStack {
+                Spacer()
+                Button("Cancel") { dismiss() }
+                Button("Rename") {
+                    state.renameCollection(collection.id, to: name)
+                    dismiss()
+                }
+                .buttonStyle(.borderedProminent)
+                .keyboardShortcut(.defaultAction)
+                .disabled(name.trimmingCharacters(in: .whitespaces).isEmpty)
+            }
+        }
+        .padding(18)
+        .onAppear { name = collection.name }
     }
 }
 
@@ -110,79 +295,361 @@ struct SidebarView: View {
 
 struct LibraryView: View {
     @EnvironmentObject var state: AppState
-    let section: LibrarySection
+    let scope: LibraryScope
 
-    @State private var playerItem: PlayerContext?
+    @Environment(\.openWindow) private var openWindow
     @State private var convertItem: VideoItem?
-    @State private var showSettings = false
     @State private var showAddURL = false
+    @State private var showActivity = false
     @State private var urlText = ""
+    @State private var search = ""
+    @State private var status: StatusFilter = .all
+    @State private var dropTargeted = false
+    @State private var showInspector = false
+    @State private var sort: LibrarySort = .newest
+    @State private var selection = Set<UUID>()
+    @State private var pendingRemoval: [VideoItem] = []
 
-    private var items: [VideoItem] { state.items.filter(section.matches) }
+    /// Everything in this scope, before the status chips and search narrow it —
+    /// used so the chips can show counts and hide themselves when irrelevant.
+    private var scoped: [VideoItem] { state.items.filter(scope.matches) }
 
-    var body: some View {
-        Group {
-            if state.items.isEmpty {
-                ZStack { BackdropView(); EmptyStateView() }
-            } else if items.isEmpty {
-                ContentUnavailableView(
-                    "Nothing \(section.rawValue.lowercased())",
-                    systemImage: section.systemImage,
-                    description: Text("Videos will show up here as they change state.")
-                )
-            } else {
-                List {
-                    ForEach(items) { item in
-                        VideoRow(item: item,
-                                 onPlay: { play(item) },
-                                 onExport: { convertItem = item })
-                            .environmentObject(state)
-                            .listRowInsets(EdgeInsets(top: 6, leading: 10, bottom: 6, trailing: 10))
-                    }
-                }
-                .listStyle(.inset)
-                .alternatingRowBackgrounds()
+    private var visible: [VideoItem] {
+        var list = scoped.filter(status.matches)
+        let q = search.trimmingCharacters(in: .whitespaces).lowercased()
+        if !q.isEmpty {
+            list = list.filter {
+                $0.meta.title.lowercased().contains(q)
+                    || (URL(string: $0.meta.downloadURL)?.host?.lowercased().contains(q) ?? false)
+                    || $0.meta.tags.contains { $0.lowercased().contains(q) }
             }
         }
-        .navigationTitle(section.rawValue)
+        return sort.apply(list)
+    }
+
+    /// Selection resolved back to items, in the order they appear on screen.
+    /// Everything batch acts on goes through here, so an action can never touch
+    /// a row the filters have hidden.
+    private var selectedItems: [VideoItem] {
+        visible.filter { selection.contains($0.id) }
+    }
+
+    var body: some View {
+        // The bar is a sibling of the content rather than a `safeAreaInset`, which
+        // reserved its height even in the branches that don't show it — leaving a
+        // band of dead space under the toolbar on the empty states.
+        VStack(spacing: 0) {
+            if showsFilterBar { filterBar }
+
+            Group {
+                if state.items.isEmpty {
+                    EmptyStateView()
+                } else if scoped.isEmpty {
+                    ContentUnavailableView("Nothing here yet", systemImage: scope.systemImage,
+                                           description: Text(emptyScopeHint))
+                } else if visible.isEmpty {
+                    ContentUnavailableView.search(text: search)
+                } else {
+                    List(selection: $selection) {
+                        ForEach(visible) { item in
+                            VideoRow(item: item,
+                                     onPlay: { play(item) },
+                                     onExport: { convertItem = item },
+                                     selection: selection,
+                                     selectedItems: { selectedItems },
+                                     onRemove: requestRemoval)
+                                .environmentObject(state)
+                                .listRowInsets(EdgeInsets(top: 6, leading: 10, bottom: 6, trailing: 10))
+                        }
+                    }
+                    .listStyle(.inset)
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+        // Dropping a file anywhere in the library imports it. Referenced in place,
+        // never copied — see AppState.importFiles.
+        .dropDestination(for: URL.self) { urls, _ in
+            !state.importFiles(urls).isEmpty
+        } isTargeted: { dropTargeted = $0 }
+        .overlay {
+            if dropTargeted {
+                RoundedRectangle(cornerRadius: 10)
+                    .strokeBorder(Color.accentColor, style: StrokeStyle(lineWidth: 2, dash: [7]))
+                    .padding(6)
+                    .allowsHitTesting(false)
+            }
+        }
+        // A filter or sort change must not silently widen or narrow what a
+        // batch action is about to hit, so anything that scrolls out of the
+        // filtered set leaves the selection with it.
+        .onChange(of: Set(visible.map(\.id))) { _, ids in
+            if !selection.isEmpty { selection.formIntersection(ids) }
+        }
+        .background { selectionShortcuts }
+        .confirmationDialog("Remove \(pendingRemoval.count) videos from your library?",
+                            isPresented: Binding(get: { !pendingRemoval.isEmpty },
+                                                 set: { if !$0 { pendingRemoval = [] } })) {
+            Button("Remove \(pendingRemoval.count) Videos", role: .destructive) {
+                state.remove(pendingRemoval)
+                selection.subtract(pendingRemoval.map(\.id))
+                pendingRemoval = []
+            }
+            Button("Cancel", role: .cancel) { pendingRemoval = [] }
+        } message: {
+            Text("The downloaded files stay on disk.")
+        }
+        .inspector(isPresented: $showInspector) {
+            inspectorContent
+                .inspectorColumnWidth(min: 260, ideal: 280, max: 340)
+        }
+        // Probing is deferred until something is actually inspected: most rows are
+        // never looked at this closely, and each probe is a subprocess.
+        .onChange(of: selection) { _, _ in
+            if showInspector, selection.count == 1, let item = selectedItems.first,
+               item.meta.probe == nil, item.meta.filePath != nil {
+                state.probeLocal(item)
+            }
+        }
+        .navigationTitle(title)
         .navigationSubtitle(subtitle)
+        .searchable(text: $search, placement: .toolbar, prompt: "Search videos")
         .toolbar { toolbarContent }
-        .sheet(item: $playerItem) { PlayerSheet(context: $0) }
-        .sheet(item: $convertItem) { ConvertSheet(item: $0).environmentObject(state) }
+        .sheet(item: $convertItem) { EditorView(item: $0).environmentObject(state) }
+    }
+
+    private var title: String {
+        switch scope {
+        case .inbox: return "Inbox"
+        case .all: return "All Videos"
+        case .collection(let id):
+            return state.collections.first { $0.id == id }?.name ?? "Collection"
+        case .smart(let f): return f.rawValue
+        case .local: return "Local Files"
+        }
+    }
+
+    private var emptyScopeHint: String {
+        switch scope {
+        case .inbox: return "New videos land here. They clear themselves after \(state.inboxExpiryDays) days — your files are never touched."
+        case .collection: return "Drop videos in from the library, or use Add to Collection."
+        default: return "Videos will show up here as they qualify."
+        }
     }
 
     private var subtitle: String {
-        let n = items.count
-        let base = "\(n) video\(n == 1 ? "" : "s")"
-        if state.activeDownloads + state.queuedCount > 0 {
-            return base + " · \(state.activeDownloads) downloading"
-                + (state.queuedCount > 0 ? ", \(state.queuedCount) queued" : "")
-        }
+        let n = visible.count
+        var base = "\(n) video\(n == 1 ? "" : "s")"
+        if n != scoped.count { base += " of \(scoped.count)" }
         return base
+    }
+
+    /// Removing one or two is an obvious, easily-redone gesture; removing a
+    /// sweep of rows the user may have selected by accident is not.
+    private func requestRemoval(_ batch: [VideoItem]) {
+        guard !batch.isEmpty else { return }
+        if batch.count > 2 {
+            pendingRemoval = batch
+        } else {
+            state.remove(batch)
+            selection.subtract(batch.map(\.id))
+        }
+    }
+
+    /// Zero-sized buttons purely to carry the key equivalents. Escape only
+    /// exists while something is selected so it doesn't shadow sheet dismissal.
+    @ViewBuilder private var selectionShortcuts: some View {
+        Button("") { selection = Set(visible.map(\.id)) }
+            .keyboardShortcut("a", modifiers: .command)
+            .frame(width: 0, height: 0).opacity(0)
+        if !selection.isEmpty {
+            Button("") { selection.removeAll() }
+                .keyboardShortcut(.escape, modifiers: [])
+                .frame(width: 0, height: 0).opacity(0)
+        }
+    }
+
+    /// The filter bar's slot, taken over while a multi-selection is live.
+    /// Chips and sort are irrelevant mid-batch, and this keeps the actions in
+    /// the one place the eye is already using to steer the list.
+    @ViewBuilder private var batchBar: some View {
+        let targets = selectedItems
+        let downloadable = targets.filter { $0.status == .idle || $0.status == .error }
+        let promotable = targets.filter { $0.meta.tier == .inbox }
+
+        HStack(spacing: 8) {
+            Text("\(targets.count) selected")
+                .font(.caption).fontWeight(.medium)
+
+            Divider().frame(height: 14)
+
+            Button {
+                for item in downloadable { state.download(item) }
+            } label: {
+                Label("Download \(downloadable.count)", systemImage: "arrow.down.to.line")
+            }
+            .disabled(downloadable.isEmpty)
+
+            Menu {
+                collectionMenuItems(for: targets)
+            } label: {
+                Label("Add to Collection", systemImage: "folder.badge.plus")
+            }
+            .fixedSize()
+
+            if !promotable.isEmpty {
+                Button {
+                    for item in promotable { state.promote(item) }
+                } label: {
+                    Label("Keep", systemImage: "pin")
+                }
+                .help("Keep these in the library instead of letting the Inbox expire them")
+            }
+
+            Button(role: .destructive) {
+                requestRemoval(targets)
+            } label: {
+                Label("Remove", systemImage: "trash")
+            }
+
+            Spacer()
+
+            Button("Done") { selection.removeAll() }
+        }
+        .labelStyle(.titleAndIcon)
+        .controlSize(.small)
+        .padding(.horizontal, 12).padding(.vertical, 5)
+        .background(.bar)
+    }
+
+    /// Disabled only when *every* target is already filed there — otherwise the
+    /// menu item still has work to do for the rest of the selection.
+    @ViewBuilder private func collectionMenuItems(for targets: [VideoItem]) -> some View {
+        ForEach(state.collections) { c in
+            Button(c.name) {
+                for item in targets { state.add(item, to: c.id) }
+            }
+            .disabled(targets.allSatisfy { $0.meta.collectionIDs.contains(c.id) })
+        }
+        if !state.collections.isEmpty { Divider() }
+        Button("New Collection…") {
+            let c = state.createCollection(named: "Untitled Collection")
+            for item in targets { state.add(item, to: c.id) }
+        }
+    }
+
+    @ViewBuilder private var inspectorContent: some View {
+        if selection.count == 1, let item = selectedItems.first {
+            MediaInspectorView(title: item.meta.title,
+                               path: item.meta.filePath,
+                               info: item.meta.probe,
+                               isProbing: item.probing)
+        } else if selection.count > 1 {
+            ContentUnavailableView("\(selection.count) Videos Selected",
+                                   systemImage: "square.stack",
+                                   description: Text("Select a single video to inspect it."))
+        } else {
+            ContentUnavailableView("Nothing Selected", systemImage: "sidebar.right",
+                                   description: Text("Select a video to see its media details."))
+        }
+    }
+
+    /// The bar has nothing useful to say when the library is empty, or when a
+    /// scope holds too little to be worth filtering — so it stays out entirely
+    /// rather than showing a row of dead controls.
+    private var showsFilterBar: Bool {
+        selection.count > 1 || (!state.items.isEmpty && !scoped.isEmpty)
+    }
+
+    /// Status as chips. One click, no navigation, and they disappear entirely
+    /// when the current scope has nothing in flight.
+    @ViewBuilder private var filterBar: some View {
+        if selection.count > 1 {
+            batchBar
+        } else {
+            statusFilterBar
+        }
+    }
+
+    @ViewBuilder private var statusFilterBar: some View {
+        let counts = Dictionary(grouping: scoped, by: { item -> StatusFilter in
+            if item.status == .downloading || item.status == .queued { return .downloading }
+            if item.status == .done { return .done }
+            if item.status == .error { return .failed }
+            return .all
+        }).mapValues(\.count)
+
+        HStack(spacing: 6) {
+            ForEach(StatusFilter.allCases) { f in
+                let n = f == .all ? scoped.count : (counts[f] ?? 0)
+                if f == .all || n > 0 {
+                    Button {
+                        status = (status == f && f != .all) ? .all : f
+                    } label: {
+                        Text(n > 0 && f != .all ? "\(f.rawValue) \(n)" : f.rawValue)
+                            .font(.caption)
+                            .padding(.horizontal, 9).padding(.vertical, 3)
+                    }
+                    .buttonStyle(.plain)
+                    .background(status == f ? Color.accentColor.opacity(0.18) : Color.secondary.opacity(0.10),
+                                in: .capsule)
+                    .foregroundStyle(status == f ? Color.accentColor : .secondary)
+                }
+            }
+            Spacer()
+            Picker("", selection: $sort) {
+                ForEach(LibrarySort.allCases) { Text($0.rawValue).tag($0) }
+            }
+            .labelsHidden().pickerStyle(.menu).controlSize(.small).frame(width: 110)
+        }
+        .padding(.horizontal, 12).padding(.vertical, 6)
+        .background(.bar)
     }
 
     @ToolbarContentBuilder
     private var toolbarContent: some ToolbarContent {
         ToolbarItemGroup(placement: .primaryAction) {
-            if state.activeDownloads + state.queuedCount > 0 {
-                ProgressView().controlSize(.small)
-            }
+            Button { state.chooseFilesToImport() } label: { Image(systemName: "folder.badge.plus") }
+                .help("Import files from your Mac")
+
+            Button {
+                showInspector.toggle()
+                if showInspector, selection.count == 1, let item = selectedItems.first,
+                   item.meta.probe == nil, item.meta.filePath != nil {
+                    state.probeLocal(item)
+                }
+            } label: { Image(systemName: "info.circle") }
+                .help("Media details")
+
             Button { showAddURL.toggle() } label: { Image(systemName: "plus") }
                 .help("Add a video by URL")
                 .popover(isPresented: $showAddURL, arrowEdge: .bottom) { addURLPopover }
 
-            if state.items.contains(where: { $0.status == .idle || $0.status == .error }) {
-                Button { state.downloadAll() } label: { Image(systemName: "arrow.down.circle") }
-                    .help("Download all")
+            // In-flight work lives here now instead of taking two sidebar rows.
+            // Always present now: it has a history worth opening even when idle.
+            Button { showActivity.toggle() } label: {
+                Image(systemName: "arrow.down.circle")
+                    .symbolVariant(state.jobs.activeCount > 0 ? .fill : .none)
             }
-            Button { showSettings.toggle() } label: { Image(systemName: "slider.horizontal.3") }
-                .help("Settings")
-                .popover(isPresented: $showSettings, arrowEdge: .bottom) {
-                    SettingsPopover().environmentObject(state)
-                }
-            if !state.items.isEmpty {
-                Button(role: .destructive) { state.clear() } label: { Image(systemName: "trash") }
-                    .help("Clear all")
+            .help("Activity")
+            .popover(isPresented: $showActivity, arrowEdge: .bottom) { ActivityCenterView() }
+
+            if case .collection(let cid) = scope,
+               let coll = state.collections.first(where: { $0.id == cid }) {
+                let readiness = state.buildReadiness(coll)
+                Button { state.buildCollection(coll) } label: { Image(systemName: "film.stack") }
+                    // The reason lives in the tooltip: a disabled button with no
+                    // explanation is the most annoying kind.
+                    .help(readiness.ready ? "Join \(readiness.reason) into one video"
+                                          : readiness.reason)
+                    .disabled(!readiness.ready)
+            }
+
+            if scoped.contains(where: { $0.status == .idle || $0.status == .error }) {
+                Button { for i in visible where i.status == .idle || i.status == .error {
+                    state.download(i)
+                } } label: { Image(systemName: "arrow.down.to.line") }
+                    .help("Download everything shown")
             }
         }
     }
@@ -214,17 +681,15 @@ struct LibraryView: View {
     }
 
     private func play(_ item: VideoItem) {
-        // Warmed on arrival (or already downloaded) — open with zero latency.
         if let url = item.warmPlayURL {
-            playerItem = PlayerContext(url: url, title: item.meta.title)
+            openWindow(value: PlayerContext(url: url, title: item.meta.title))
             return
         }
-        // Cold: never warmed, or the signed URL aged out. Resolve and re-cache.
         item.statusLine = "Resolving stream…"
         Task {
             if let url = await DownloadManager.shared.resolvePlayableURL(for: item.meta) {
                 item.setPlayURL(url, expires: DownloadManager.expiry(for: url.absoluteString))
-                playerItem = PlayerContext(url: url, title: item.meta.title)
+                openWindow(value: PlayerContext(url: url, title: item.meta.title))
                 item.statusLine = ""
             } else {
                 item.statusLine = "Couldn't resolve a playable stream"
@@ -232,25 +697,26 @@ struct LibraryView: View {
         }
     }
 }
-
 // MARK: - Backdrop
 
+/// Backdrop for full-bleed surfaces (onboarding).
+///
+/// Achromatic on purpose. This was a hardcoded dark purple gradient with no
+/// light-mode variant, so in Light Mode it rendered as a dark slab in an
+/// otherwise light window — and worse, `.regularMaterial` cards over it degraded
+/// into opaque grey bricks, which made the content look broken rather than just
+/// the background. Depth now comes from value instead of hue, so it reads
+/// correctly in both appearances and can never fight the user's accent colour.
 struct BackdropView: View {
+    @Environment(\.colorScheme) private var scheme
+
     var body: some View {
         ZStack {
+            Color(nsColor: .windowBackgroundColor)
             LinearGradient(
-                colors: [Color(red: 0.10, green: 0.09, blue: 0.20),
-                         Color(red: 0.05, green: 0.05, blue: 0.10)],
-                startPoint: .topLeading, endPoint: .bottomTrailing
+                colors: [Color.primary.opacity(scheme == .dark ? 0.07 : 0.045), .clear],
+                startPoint: .top, endPoint: .center
             )
-            Circle()
-                .fill(Color(red: 0.42, green: 0.36, blue: 0.90).opacity(0.45))
-                .frame(width: 420).blur(radius: 140)
-                .offset(x: -160, y: -220)
-            Circle()
-                .fill(Color(red: 0.20, green: 0.55, blue: 0.95).opacity(0.35))
-                .frame(width: 380).blur(radius: 150)
-                .offset(x: 180, y: 260)
         }
         .ignoresSafeArea()
     }
@@ -269,6 +735,13 @@ struct VideoRow: View {
     @ObservedObject var item: VideoItem
     let onPlay: () -> Void
     var onExport: () -> Void = {}
+    /// The live list selection, so the row can tell whether a right-click on it
+    /// is a right-click on the whole selection.
+    var selection: Set<UUID> = []
+    var selectedItems: () -> [VideoItem] = { [] }
+    /// Removal goes back up: only the list knows whether a batch is big enough
+    /// to deserve a confirmation.
+    var onRemove: ([VideoItem]) -> Void = { _ in }
     @State private var showQuality = false
     @State private var hovering = false
 
@@ -300,10 +773,15 @@ struct VideoRow: View {
                     .truncationMode(.middle)
 
                 HStack(spacing: 5) {
-                    if let p = item.meta.platform, !p.isEmpty { Pill(text: p, tint: .purple) }
+                    if let p = item.meta.platform, !p.isEmpty { Pill(text: p, tint: .accentColor) }
                     if let d = item.meta.prettyDuration { Pill(text: d) }
                     if item.meta.height > 0 { Pill(text: "\(item.meta.height)p") }
-                    if let host = URL(string: item.meta.downloadURL)?.host {
+                    // Imported files have no host; the containing folder is the
+                    // equivalent orienting detail.
+                    if item.meta.isLocal, let path = item.meta.importedPath {
+                        Text(URL(fileURLWithPath: path).deletingLastPathComponent().lastPathComponent)
+                            .font(.caption2).foregroundStyle(.tertiary).lineLimit(1)
+                    } else if let host = URL(string: item.meta.downloadURL)?.host {
                         Text(host).font(.caption2).foregroundStyle(.tertiary).lineLimit(1)
                     }
                 }
@@ -314,7 +792,15 @@ struct VideoRow: View {
             Spacer(minLength: 4)
             controls.opacity(hovering || alwaysShowControls ? 1 : 0)
         }
-        .padding(.vertical, 5)
+        // Fixed, not intrinsic. A row's natural height depends on what enrichment
+        // has filled in so far — a fresh row is thumbnail-height, and once the
+        // pills and a status line arrive the text column overtakes the thumbnail
+        // and the row grows. Every row therefore resized underneath itself moments
+        // after being added, and while the insertion was still animating that
+        // showed up as rows overlapping each other. A library list wants uniform
+        // rows anyway; 64 clears the tallest case (three pills plus a status line).
+        .frame(height: 64)
+        .padding(.vertical, 4)
         .contentShape(.rect)
         .onHover { hovering = $0 }
         .onTapGesture(count: 2, perform: onPlay)
@@ -326,7 +812,46 @@ struct VideoRow: View {
         item.status == .downloading || item.status == .queued
     }
 
+    /// macOS convention: right-clicking inside a multi-selection acts on the
+    /// whole selection; right-clicking outside it acts on that row alone.
     @ViewBuilder private var contextMenu: some View {
+        if selection.count > 1, selection.contains(item.id) {
+            batchMenu(selectedItems())
+        } else {
+            singleMenu
+        }
+    }
+
+    @ViewBuilder private func batchMenu(_ targets: [VideoItem]) -> some View {
+        let downloadable = targets.filter { $0.status == .idle || $0.status == .error }
+        let promotable = targets.filter { $0.meta.tier == .inbox }
+
+        if !downloadable.isEmpty {
+            Button("Download \(downloadable.count) Videos") {
+                for i in downloadable { state.download(i) }
+            }
+        }
+        if !promotable.isEmpty {
+            Button("Keep \(promotable.count) in Library") {
+                for i in promotable { state.promote(i) }
+            }
+        }
+        Menu("Add \(targets.count) to Collection") {
+            ForEach(state.collections) { c in
+                Button(c.name) { for i in targets { state.add(i, to: c.id) } }
+                    .disabled(targets.allSatisfy { $0.meta.collectionIDs.contains(c.id) })
+            }
+            if !state.collections.isEmpty { Divider() }
+            Button("New Collection…") {
+                let c = state.createCollection(named: "Untitled Collection")
+                for i in targets { state.add(i, to: c.id) }
+            }
+        }
+        Divider()
+        Button("Remove \(targets.count) Videos", role: .destructive) { onRemove(targets) }
+    }
+
+    @ViewBuilder private var singleMenu: some View {
         Button("Play", action: onPlay)
         if item.status == .idle || item.status == .error {
             Button("Download") { state.download(item) }
@@ -342,7 +867,29 @@ struct VideoRow: View {
             NSPasteboard.general.setString(item.meta.downloadURL, forType: .string)
         }
         Divider()
-        Button("Remove", role: .destructive) { state.remove(item) }
+        if item.meta.tier == .inbox {
+            Button("Keep in Library") { state.promote(item) }
+        }
+        Menu("Add to Collection") {
+            ForEach(state.collections) { c in
+                Button(c.name) { state.add(item, to: c.id) }
+                    .disabled(item.meta.collectionIDs.contains(c.id))
+            }
+            if !state.collections.isEmpty { Divider() }
+            Button("New Collection…") {
+                let c = state.createCollection(named: "Untitled Collection")
+                state.add(item, to: c.id)
+            }
+        }
+        if !item.meta.collectionIDs.isEmpty {
+            Menu("Remove from Collection") {
+                ForEach(state.collections.filter { item.meta.collectionIDs.contains($0.id) }) { c in
+                    Button(c.name) { state.remove(item, from: c.id) }
+                }
+            }
+        }
+        Divider()
+        Button("Remove", role: .destructive) { onRemove([item]) }
     }
 
     @ViewBuilder private var statusView: some View {
@@ -364,7 +911,7 @@ struct VideoRow: View {
         case .downloading:
             HStack(spacing: 7) {
                 ProgressView(value: item.progress)
-                    .progressViewStyle(.linear).tint(.purple)
+                    .progressViewStyle(.linear)
                     .frame(width: 130)
                 Text("\(Int(item.progress * 100))%")
                     .font(.caption2).monospacedDigit().foregroundStyle(.secondary)
@@ -372,7 +919,7 @@ struct VideoRow: View {
                     .font(.caption2).foregroundStyle(.tertiary).lineLimit(1)
             }
         case .done:
-            Label("Saved", systemImage: "checkmark.circle.fill")
+            Label(item.meta.isLocal ? "On disk" : "Saved", systemImage: "checkmark.circle.fill")
                 .font(.caption2).foregroundStyle(.green)
         case .error:
             Label(item.statusLine, systemImage: "exclamationmark.triangle.fill")
@@ -413,7 +960,7 @@ struct VideoRow: View {
                     Image(systemName: "arrow.down.to.line").font(.system(size: 11))
                         .frame(width: 26, height: 22)
                 }
-                .buttonStyle(.borderedProminent).tint(.purple)
+                .buttonStyle(.borderedProminent)
                 .help("Download…")
                 .popover(isPresented: $showQuality, arrowEdge: .trailing) {
                     QualityPopover(item: item) { quality in
@@ -463,7 +1010,7 @@ struct QualityPopover: View {
                 } label: {
                     HStack {
                         Image(systemName: q.isAudioOnly ? "music.note" : "film")
-                            .foregroundStyle(q.isAudioOnly ? .pink : .purple)
+                            .foregroundStyle(q.isAudioOnly ? Color.pink : Color.accentColor)
                             .frame(width: 18)
                         Text(q.rawValue)
                         Spacer()
@@ -491,244 +1038,143 @@ struct QualityPopover: View {
     }
 }
 
-// MARK: - Settings
-
-struct SettingsPopover: View {
-    @EnvironmentObject var state: AppState
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            Text("Download Settings").font(.headline)
-
-            VStack(alignment: .leading, spacing: 6) {
-                Text("Default quality").font(.caption).foregroundStyle(.secondary)
-                Picker("", selection: $state.defaultQuality) {
-                    ForEach(DownloadQuality.allCases) { Text($0.rawValue).tag($0) }
-                }
-                .labelsHidden().pickerStyle(.menu)
-            }
-
-            Toggle(isOn: $state.embedSubtitles) {
-                Label("Embed subtitles (when available)", systemImage: "captions.bubble")
-            }
-            Toggle(isOn: $state.embedThumbnail) {
-                Label("Embed thumbnail", systemImage: "photo")
-            }
-
-            Divider()
-
-            VStack(alignment: .leading, spacing: 6) {
-                Text("Save to").font(.caption).foregroundStyle(.secondary)
-                HStack {
-                    Text(state.downloadFolder.path)
-                        .font(.caption).lineLimit(1).truncationMode(.middle)
-                        .foregroundStyle(.secondary)
-                    Spacer()
-                    Button("Change…") { state.chooseDownloadFolder() }
-                        .controlSize(.small)
-                }
-            }
-
-            Divider()
-
-            ExtensionSetupView()
-
-            Divider()
-
-            VStack(alignment: .leading, spacing: 6) {
-                Text("Connection").font(.caption).foregroundStyle(.secondary)
-                HStack(spacing: 7) {
-                    Circle()
-                        .fill(state.serverRunning ? Color.green : Color.orange)
-                        .frame(width: 8, height: 8)
-                    Text(state.serverRunning
-                         ? "Active · listening on 127.0.0.1:\(state.port)"
-                         : state.serverStatus)
-                        .font(.caption).foregroundStyle(.secondary)
-                        .lineLimit(2)
-                }
-            }
-
-            Divider()
-            Label(state.toolSummary, systemImage: state.toolsReady ? "checkmark.seal.fill" : "exclamationmark.triangle.fill")
-                .font(.caption)
-                .foregroundStyle(state.toolsReady ? .green : .orange)
-                .lineLimit(2)
-        }
-        .padding(16)
-        .frame(width: 320)
-    }
-}
-
 // MARK: - Convert / trim
 
-struct ConvertSheet: View {
+/// Trim, transform and export a video.
+///
+/// Replaces a sheet with two text fields you typed times into blind — no
+/// scrubber, no preview, and a `parseTime` that silently returned 0 on a typo, so
+/// a mistyped range exported an empty file with no warning.
+struct EditorView: View {
     @EnvironmentObject var state: AppState
     @ObservedObject var item: VideoItem
     @Environment(\.dismiss) private var dismiss
 
-    @State private var kind: ExportKind = .trim
-    @State private var startText = "0:00"
-    @State private var endText = ""
+    @State private var player: AVPlayer?
+    @State private var recipe = EditRecipe.identity
+    @State private var targetID: String = ExportTarget.mp4.id
+    @State private var inPoint: Double = 0
+    @State private var outPoint: Double = 0
+    @State private var loopSelection = false
+    @State private var duration: Double = 0
+    @State private var resolving = true
+
+    private var fps: Double? { item.meta.probe?.video?.fps }
+    private var target: ExportTarget {
+        ExportTarget.allCases.first { $0.id == targetID } ?? .mp4
+    }
+    private var chapters: [TimelineChapter] {
+        item.meta.chapters.map { TimelineChapter(id: $0.id, title: $0.title, start: $0.start) }
+    }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            Text("Export").font(.title3).fontWeight(.bold)
-            Text(item.meta.title).font(.callout).foregroundStyle(.secondary).lineLimit(2)
-
-            Picker("Format", selection: $kind) {
-                ForEach(ExportKind.allCases) { Text($0.rawValue).tag($0) }
-            }
-            .pickerStyle(.segmented)
-
-            if kind.usesTimeRange {
-                HStack(spacing: 8) {
-                    VStack(alignment: .leading, spacing: 3) {
-                        Text("Start").font(.caption).foregroundStyle(.secondary)
-                        TextField("0:00", text: $startText).textFieldStyle(.roundedBorder).frame(width: 90)
-                    }
-                    Image(systemName: "arrow.right").foregroundStyle(.secondary).padding(.top, 14)
-                    VStack(alignment: .leading, spacing: 3) {
-                        Text("End").font(.caption).foregroundStyle(.secondary)
-                        TextField(endPlaceholder, text: $endText).textFieldStyle(.roundedBorder).frame(width: 90)
+        VStack(spacing: 0) {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(item.meta.title).font(.headline).lineLimit(1)
+                    if !item.meta.chapters.isEmpty {
+                        Text("\(item.meta.chapters.count) chapters")
+                            .font(.caption).foregroundStyle(.secondary)
                     }
                 }
-                Text(kind == .gif ? "Tip: keep GIFs short (a few seconds)." : "Leave End blank to go to the end.")
-                    .font(.caption2).foregroundStyle(.secondary)
+                Spacer()
+            }
+            .padding(14)
+
+            Divider()
+
+            if let player, duration > 0 {
+                TimelineView(player: player, duration: duration,
+                             inPoint: $inPoint, outPoint: $outPoint,
+                             chapters: chapters, fps: fps)
+                    .padding(.horizontal, 14).padding(.top, 10)
+                TransportControls(player: player, inPoint: $inPoint, outPoint: $outPoint,
+                                  loopSelection: $loopSelection, fps: fps)
+                    .padding(.horizontal, 14).padding(.bottom, 8)
             } else {
-                Text("Extracts the full audio track as an MP3.")
-                    .font(.caption).foregroundStyle(.secondary)
+                // A timeline needs a duration; without one there is nothing to scrub.
+                ContentUnavailableView(resolving ? "Preparing preview…" : "Can’t preview this video",
+                                       systemImage: resolving ? "clock" : "exclamationmark.triangle",
+                                       description: Text(resolving
+                                            ? "Reading the media."
+                                            : "VideoPro couldn’t resolve a playable stream to scrub."))
+                    .frame(height: 220)
             }
 
-            if !state.hasLocalFile(item) {
-                Label(sourceNote, systemImage: "arrow.down.circle")
-                    .font(.caption2).foregroundStyle(.secondary)
+            Divider()
+
+            HStack(spacing: 18) {
+                Picker("Rotate", selection: $recipe.rotation) {
+                    Text("None").tag(Rotation.none)
+                    Text("90° CW").tag(Rotation.cw90)
+                    Text("90° CCW").tag(Rotation.ccw90)
+                    Text("180°").tag(Rotation.half)
+                }
+                .frame(width: 150)
+
+                Picker("Speed", selection: $recipe.speed) {
+                    ForEach([0.25, 0.5, 1.0, 1.5, 2.0, 4.0], id: \.self) { v in
+                        Text(v == 1.0 ? "Normal" : "\(v.formatted(.number))×").tag(v)
+                    }
+                }
+                .frame(width: 150)
+
+                Toggle("Mirror", isOn: $recipe.flipHorizontal)
+                Toggle("Mute", isOn: $recipe.mute)
+                Spacer()
             }
+            .padding(.horizontal, 14).padding(.vertical, 10)
+
+            Divider()
 
             HStack {
+                Picker("Export as", selection: $targetID) {
+                    ForEach(ExportTarget.allCases) { Text($0.displayName).tag($0.id) }
+                }
+                .frame(width: 280)
                 Spacer()
                 Button("Cancel") { dismiss() }
                 Button("Export") {
-                    state.export(item, kind: kind,
-                                 start: parseTime(startText),
-                                 end: endText.isEmpty ? (item.meta.duration ?? 0) : parseTime(endText))
+                    var r = recipe
+                    // Only record bounds that actually trim, so an untouched
+                    // selection stays an identity recipe and can take the fast
+                    // remux path instead of a needless re-encode.
+                    r.inPoint = inPoint > 0.001 ? inPoint : nil
+                    r.outPoint = outPoint < duration - 0.001 ? outPoint : nil
+                    state.export(item, recipe: r, target: target)
                     dismiss()
                 }
                 .buttonStyle(.borderedProminent)
                 .keyboardShortcut(.defaultAction)
+                .disabled(outPoint <= inPoint)
             }
+            .padding(14)
         }
-        .padding(20)
-        .frame(width: 380)
+        .frame(width: 720)
+        .task { await prepare() }
+        .onDisappear { player?.pause() }
     }
 
-    private var endPlaceholder: String {
-        if let d = item.meta.prettyDuration { return d }
-        return "end"
-    }
+    private func prepare() async {
+        recipe = item.meta.recipe ?? .identity
 
-    /// This video isn't downloaded, so say what we'll pull down for the export.
-    private var sourceNote: String {
-        switch kind {
-        case .audio: return "Not downloaded — VideoPro will fetch the audio track only."
-        case .trim, .gif:
-            return endText.isEmpty
-                ? "Not downloaded — VideoPro will fetch the video first."
-                : "Not downloaded — VideoPro will fetch just this section."
-        }
-    }
+        // Prefer bytes on disk, then a warm stream, then resolve one — an
+        // un-downloaded video is still editable, since the export fetches only the
+        // section it needs.
+        var url = item.meta.filePath.map { URL(fileURLWithPath: $0) }
+        if url == nil { url = item.warmPlayURL }
+        if url == nil { url = await DownloadManager.shared.resolvePlayableURL(for: item.meta) }
+        guard let url else { resolving = false; return }
 
-    private func parseTime(_ s: String) -> Double {
-        let parts = s.split(separator: ":").map { Double($0) ?? 0 }
-        switch parts.count {
-        case 3: return parts[0] * 3600 + parts[1] * 60 + parts[2]
-        case 2: return parts[0] * 60 + parts[1]
-        case 1: return parts[0]
-        default: return 0
-        }
-    }
-}
+        let asset = AVURLAsset(url: url)
+        let loaded = (try? await asset.load(.duration).seconds) ?? item.meta.duration ?? 0
+        guard loaded.isFinite, loaded > 0 else { resolving = false; return }
 
-// MARK: - Extension setup
-
-/// Lists the browsers actually installed on this Mac and sets the extension up in
-/// the one you pick.
-///
-/// The old flow hard-coded "Chrome" and told you to open `chrome://extensions` —
-/// useless if you don't have Chrome (Arc, Brave and Edge users got no working path
-/// at all). It also never told you whether setup had actually worked.
-struct ExtensionSetupView: View {
-    @EnvironmentObject var state: AppState
-    @State private var chromium: [BrowserTarget] = []
-    @State private var safari: BrowserTarget?
-    @State private var sheetBrowser: BrowserTarget?
-    /// Ticks so "last seen" stays honest while the popover is open.
-    @State private var now = Date()
-    private let tick = Timer.publish(every: 5, on: .main, in: .common).autoconnect()
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 9) {
-            Text("Browser extension").font(.caption).foregroundStyle(.secondary)
-
-            // Say plainly whether it's working — no guessing.
-            HStack(spacing: 7) {
-                Circle()
-                    .fill(state.extensionStatus.connected ? Color.green : Color.secondary.opacity(0.5))
-                    .frame(width: 8, height: 8)
-                Text(state.extensionStatus.text).font(.caption)
-                    .foregroundStyle(state.extensionStatus.connected ? .primary : .secondary)
-            }
-
-            if chromium.isEmpty && safari == nil {
-                Text("No supported browser found.")
-                    .font(.caption2).foregroundStyle(.secondary)
-            }
-
-            ForEach(chromium) { b in
-                browserRow(
-                    name: b.name,
-                    detail: "Guided setup — takes about 20 seconds",
-                    action: { sheetBrowser = b },
-                    label: "Set up…"
-                )
-            }
-
-            if let s = safari {
-                browserRow(
-                    name: s.name,
-                    detail: "Enable in Safari’s Extensions settings",
-                    action: { state.openSafariExtensionSettings() },
-                    label: "Enable…"
-                )
-            }
-
-            Text(state.extensionFolder.path)
-                .font(.system(size: 9, design: .monospaced))
-                .foregroundStyle(.tertiary)
-                .lineLimit(1).truncationMode(.middle)
-                .textSelection(.enabled)
-        }
-        .onAppear {
-            chromium = BrowserScan.chromiumInstalled()
-            safari = BrowserScan.safariInstalled()
-        }
-        .onReceive(tick) { now = $0 }
-        .sheet(item: $sheetBrowser) { b in
-            ExtensionInstallSheet(browser: b).environmentObject(state)
-        }
-    }
-
-    @ViewBuilder
-    private func browserRow(name: String, detail: String,
-                            action: @escaping () -> Void, label: String) -> some View {
-        HStack(spacing: 8) {
-            VStack(alignment: .leading, spacing: 1) {
-                Text(name).font(.caption).fontWeight(.medium)
-                Text(detail).font(.system(size: 10)).foregroundStyle(.secondary)
-            }
-            Spacer()
-            Button(label, action: action).controlSize(.small)
-        }
+        duration = loaded
+        inPoint = recipe.inPoint ?? 0
+        outPoint = recipe.outPoint ?? loaded
+        player = AVPlayer(playerItem: AVPlayerItem(asset: asset))
+        resolving = false
     }
 }
 
@@ -752,7 +1198,7 @@ struct ExtensionInstallSheet: View {
         VStack(alignment: .leading, spacing: 14) {
             HStack(spacing: 9) {
                 Image(systemName: "puzzlepiece.extension.fill")
-                    .font(.title2).foregroundStyle(.purple)
+                    .font(.title2).foregroundStyle(.tint)
                 VStack(alignment: .leading, spacing: 1) {
                     Text("Set up in \(browser.name)").font(.title3).fontWeight(.bold)
                     Text("VideoPro opened \(browser.name)’s Extensions page and copied the folder path.")
@@ -830,7 +1276,7 @@ struct ExtensionInstallSheet: View {
             Text("\(n)")
                 .font(.caption2).fontWeight(.bold).foregroundStyle(.white)
                 .frame(width: 16, height: 16)
-                .background(.purple, in: .circle)
+                .background(.tint, in: .circle)
             Text(.init(markdown)).font(.callout)
         }
     }
@@ -851,7 +1297,7 @@ struct OnboardingView: View {
             BackdropView()
             VStack(spacing: 16) {
                 Image(systemName: "play.rectangle.on.rectangle.fill")
-                    .font(.system(size: 46)).foregroundStyle(.purple.gradient)
+                    .font(.system(size: 46)).foregroundStyle(Color.accentColor.gradient)
                 Text("Welcome to VideoPro").font(.title2).fontWeight(.bold)
                 Text("Find videos in your browser, then send them here to play or download.")
                     .font(.callout).foregroundStyle(.secondary)
@@ -873,7 +1319,7 @@ struct OnboardingView: View {
                             Label("Install in \(b.name)", systemImage: "arrow.down.circle.fill")
                                 .frame(maxWidth: .infinity)
                         }
-                        .buttonStyle(.glassProminent).tint(.purple).controlSize(.large)
+                        .buttonStyle(.glassProminent).controlSize(.large)
                     }
 
                     if safari != nil {
@@ -929,7 +1375,7 @@ struct EmptyStateView: View {
         VStack(spacing: 14) {
             Image(systemName: "tray.and.arrow.down.fill")
                 .font(.system(size: 46))
-                .foregroundStyle(.purple.gradient)
+                .foregroundStyle(Color.accentColor.gradient)
             Text("No videos yet").font(.title3).fontWeight(.semibold)
             Text("Find a video in your browser and click **Send to VideoPro**.")
                 .font(.callout).foregroundStyle(.secondary)
@@ -1004,54 +1450,65 @@ struct ThumbView: View {
     static func localImage(_ s: String) -> NSImage? {
         if s.hasPrefix("data:"), let comma = s.firstIndex(of: ",") {
             let b64 = String(s[s.index(after: comma)...])
-            guard let data = Data(base64Encoded: b64) else { return nil }
-            return NSImage(data: data)
+            // Tolerate whitespace/newlines that survive a JSON round-trip; strict
+            // decoding would return nil and silently drop an otherwise fine frame.
+            guard let data = Data(base64Encoded: b64, options: .ignoreUnknownCharacters)
+            else { return nil }
+            return decode(data)
         }
         if s.hasPrefix("/") {
-            return NSImage(contentsOfFile: s)
+            guard let data = FileManager.default.contents(atPath: s) else { return nil }
+            return decode(data)
         }
-        if s.hasPrefix("file://"), let url = URL(string: s) {
-            return NSImage(contentsOf: url)
+        if s.hasPrefix("file://"), let url = URL(string: s), let data = try? Data(contentsOf: url) {
+            return decode(data)
         }
         return nil
+    }
+
+    /// Decode **only** if the payload is a whole image.
+    ///
+    /// `NSImage(data:)` is happy to return an object for a half-written JPEG: it
+    /// decodes the scanlines it got and leaves the rest grey, which renders as a
+    /// thin coloured bar across the top of the thumbnail. Because that object is
+    /// non-nil, the caller takes the "we have an image" branch and the placeholder
+    /// never gets a chance to show.
+    ///
+    /// ImageIO is no help here — `CGImageSourceCreateWithData` treats its buffer as
+    /// final, so it reports `.statusComplete` for a truncated JPEG just as readily
+    /// as for an intact one (measured, not assumed). What *does* separate them is
+    /// the container's terminator, so check that structurally.
+    static func decode(_ data: Data) -> NSImage? {
+        guard isComplete(data),
+              let src = CGImageSourceCreateWithData(data as CFData, nil),
+              CGImageSourceGetCount(src) > 0,
+              let cg = CGImageSourceCreateImageAtIndex(src, 0, nil),
+              cg.width > 0, cg.height > 0
+        else { return nil }
+        return NSImage(cgImage: cg, size: NSSize(width: cg.width, height: cg.height))
+    }
+
+    /// Does this buffer actually end where its format says it should?
+    ///
+    /// Covers the two formats we ever hold: JPEG from the extension's canvas grab
+    /// and from ffmpeg's frame export, and PNG defensively. Anything else is
+    /// passed through to the decoder rather than rejected on a guess.
+    private static func isComplete(_ data: Data) -> Bool {
+        guard data.count > 4 else { return false }
+        let head = [UInt8](data.prefix(4))
+        if head[0] == 0xFF, head[1] == 0xD8, head[2] == 0xFF {
+            // JPEG: a bare FFD9 is the end-of-image marker. It can't occur inside
+            // entropy-coded data, where a literal FF is byte-stuffed as FF00.
+            return data.range(of: Data([0xFF, 0xD9]), options: .backwards) != nil
+        }
+        if head == [0x89, 0x50, 0x4E, 0x47] {
+            return data.range(of: Data("IEND".utf8), options: .backwards) != nil
+        }
+        return true
     }
 }
 
 // MARK: - Player
-
-struct PlayerContext: Identifiable {
-    let id = UUID()
-    let url: URL
-    let title: String
-}
-
-struct PlayerSheet: View {
-    let context: PlayerContext
-    @Environment(\.dismiss) private var dismiss
-    @State private var player: AVPlayer
-
-    init(context: PlayerContext) {
-        self.context = context
-        _player = State(initialValue: AVPlayer(url: context.url))
-    }
-
-    var body: some View {
-        VStack(spacing: 0) {
-            HStack {
-                Text(context.title).font(.headline).lineLimit(1)
-                Spacer()
-                Button("Done") { player.pause(); dismiss() }.buttonStyle(.glass)
-            }
-            .padding(12)
-            PlayerView(player: player)
-                .frame(minWidth: 720, minHeight: 405)
-        }
-        .frame(minWidth: 720, minHeight: 460)
-        .background(.black)
-        .onAppear { player.play() }
-        .onDisappear { player.pause() }
-    }
-}
 
 /// AppKit AVPlayerView wrapped for SwiftUI. Using this instead of SwiftUI's
 /// `VideoPlayer` avoids a metadata crash in _AVKit_SwiftUI on some macOS builds.

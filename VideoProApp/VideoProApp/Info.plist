@@ -16,6 +16,10 @@
 	<true/>
 	<key>SUScheduledCheckInterval</key>
 	<integer>86400</integer>
+	<!-- Mandatory for the front-tab grab. Without this key macOS denies the Apple
+	     event outright instead of prompting, and the failure looks like a bug. -->
+	<key>NSAppleEventsUsageDescription</key>
+	<string>VideoPro reads the web address of your browser’s current tab so it can download the video you’re watching.</string>
 	<key>CFBundleURLTypes</key>
 	<array>
 		<dict>

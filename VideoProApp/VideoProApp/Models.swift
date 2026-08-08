@@ -3,6 +3,17 @@ import Combine
 
 // MARK: - Persisted / wire data
 
+/// Whether an item is passing through or has been deliberately kept.
+///
+/// Everything arrives in `.inbox` and ages out of the library view on its own —
+/// the file on disk is never touched, only the entry. Acting on an item in a way
+/// that implies intent (tagging it, adding it to a collection, editing it)
+/// promotes it to `.kept`, where it stays until removed by hand. This is what
+/// lets a one-off grab leave no mess without making the collector clean up.
+enum LibraryTier: String, Codable, Sendable {
+    case inbox, kept
+}
+
 /// Pure, Codable, Sendable description of a video. This is what travels over the
 /// HTTP bridge from the extension and what we persist to disk.
 struct VideoMeta: Codable, Equatable, Identifiable, Sendable {
@@ -18,6 +29,97 @@ struct VideoMeta: Codable, Equatable, Identifiable, Sendable {
     var platform: String?        // "YouTube", "Vimeo", ...
     var receivedAt: Date = Date()
     var downloadedPath: String? = nil   // set once successfully downloaded
+
+    var tier: LibraryTier = .inbox
+    var tags: [String] = []
+    var collectionIDs: [UUID] = []
+
+    /// Set when the user imported a file that VideoPro didn't fetch.
+    ///
+    /// This is the field that breaks the old assumption that every item has a
+    /// remote source: an imported file has no page, no media URL, and nothing for
+    /// yt-dlp to do. Anything that reads `downloadURL` has to cope with "" — see
+    /// `isLocal`, which is the check to branch on.
+    var importedPath: String? = nil
+
+    /// Technical detail from ffprobe. Cached because probing costs a subprocess
+    /// and the answer can't change unless the file does.
+    var probe: MediaInfo? = nil
+
+    /// Chapter markers, when the source has them.
+    var chapters: [VideoChapter] = []
+
+    /// The user's edit, kept rather than applied. Non-destructive: the source is
+    /// never modified, so the same recipe can be re-exported to several targets
+    /// and revised long after the fact.
+    var recipe: EditRecipe? = nil
+
+    /// Decoded by hand so libraries written before these fields existed still
+    /// load. Swift's synthesised `Decodable` throws on a missing key even when the
+    /// property has a default, so every new field has to be `decodeIfPresent`.
+    /// Pre-existing items are treated as `.kept`: they predate the Inbox concept,
+    /// and quietly expiring somebody's existing library would be indefensible.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decodeIfPresent(UUID.self, forKey: .id) ?? UUID()
+        title = try c.decodeIfPresent(String.self, forKey: .title) ?? "Untitled video"
+        pageURL = try c.decodeIfPresent(String.self, forKey: .pageURL) ?? ""
+        mediaURL = try c.decodeIfPresent(String.self, forKey: .mediaURL) ?? ""
+        sourceKind = try c.decodeIfPresent(String.self, forKey: .sourceKind) ?? "stream"
+        thumbnail = try c.decodeIfPresent(String.self, forKey: .thumbnail) ?? ""
+        duration = try c.decodeIfPresent(Double.self, forKey: .duration)
+        width = try c.decodeIfPresent(Int.self, forKey: .width) ?? 0
+        height = try c.decodeIfPresent(Int.self, forKey: .height) ?? 0
+        platform = try c.decodeIfPresent(String.self, forKey: .platform)
+        receivedAt = try c.decodeIfPresent(Date.self, forKey: .receivedAt) ?? Date()
+        downloadedPath = try c.decodeIfPresent(String.self, forKey: .downloadedPath)
+        tier = try c.decodeIfPresent(LibraryTier.self, forKey: .tier) ?? .kept
+        tags = try c.decodeIfPresent([String].self, forKey: .tags) ?? []
+        collectionIDs = try c.decodeIfPresent([UUID].self, forKey: .collectionIDs) ?? []
+        importedPath = try c.decodeIfPresent(String.self, forKey: .importedPath)
+        probe = try c.decodeIfPresent(MediaInfo.self, forKey: .probe)
+        chapters = try c.decodeIfPresent([VideoChapter].self, forKey: .chapters) ?? []
+        recipe = try c.decodeIfPresent(EditRecipe.self, forKey: .recipe)
+    }
+
+    init(title: String, pageURL: String, mediaURL: String, sourceKind: String,
+         thumbnail: String, duration: Double?, width: Int, height: Int,
+         platform: String?, tier: LibraryTier = .inbox) {
+        self.title = title
+        self.pageURL = pageURL
+        self.mediaURL = mediaURL
+        self.sourceKind = sourceKind
+        self.thumbnail = thumbnail
+        self.duration = duration
+        self.width = width
+        self.height = height
+        self.platform = platform
+        self.tier = tier
+    }
+
+    /// A file the user brought in themselves. `.kept` immediately: importing is
+    /// an explicit act, so it would be wrong to expire it out of the Inbox.
+    init(importing url: URL) {
+        self.title = url.deletingPathExtension().lastPathComponent
+        self.pageURL = ""
+        self.mediaURL = ""
+        self.sourceKind = "local"
+        self.thumbnail = ""
+        self.duration = nil
+        self.width = 0
+        self.height = 0
+        self.platform = nil
+        self.importedPath = url.path
+        self.tier = .kept
+    }
+
+    /// True when the bytes are already on disk and there is nothing to fetch.
+    /// Branch on this rather than testing `downloadURL.isEmpty`, which is also
+    /// true for a malformed remote item.
+    var isLocal: Bool { importedPath != nil }
+
+    /// Where the file lives, whether it was imported or downloaded.
+    var filePath: String? { importedPath ?? downloadedPath }
 
     /// The URL we hand to yt-dlp. Prefer the page URL for platform pages,
     /// otherwise fall back to the direct media URL.
@@ -61,6 +163,30 @@ struct VideoMeta: Codable, Equatable, Identifiable, Sendable {
             .lowercased() else { return false }
         return platformHosts.contains(where: { host == $0 || host.hasSuffix("." + $0) })
     }
+}
+
+/// A chapter marker. yt-dlp returns these in `-J` for most platform videos and
+/// we were discarding them — they're the cheapest way to make a long video
+/// navigable, and each one is a ready-made clip boundary.
+struct VideoChapter: Codable, Equatable, Sendable, Identifiable {
+    var id: UUID = UUID()
+    var title: String
+    var start: Double
+    var end: Double?
+
+    private enum CodingKeys: String, CodingKey { case id, title, start, end }
+}
+
+// MARK: - Collections
+
+/// A user-made grouping. Ordered, because a collection is also the sequence the
+/// collection builder will concatenate (see PLAN.md M6) — so the order the user
+/// arranges here is the order clips play in.
+struct VideoCollection: Codable, Identifiable, Equatable, Sendable {
+    var id: UUID = UUID()
+    var name: String
+    var ordering: [UUID] = []
+    var createdAt: Date = Date()
 }
 
 // MARK: - Live UI item
@@ -125,7 +251,15 @@ struct DownloadOptions: Sendable {
     var quality: DownloadQuality = .bestMP4
     var embedThumbnail: Bool = true
     var embedSubtitles: Bool = true
-    var subtitleLanguages: String = "en.*,en"
+    /// Deliberately explicit rather than `en.*`.
+    ///
+    /// `en.*` looks like "English and its regional variants", but yt-dlp treats it
+    /// as a regex, so it also matches YouTube's translated auto-captions —
+    /// `en-de` is "English FROM German", not a variant. YouTube now offers those
+    /// for essentially every language pair, so the glob pulled several tracks,
+    /// tripped rate limiting, and the resulting `HTTP 429` aborted the whole
+    /// download, video included.
+    var subtitleLanguages: String = "en,en-orig"
 
     static let `default` = DownloadOptions()
 }
@@ -162,7 +296,18 @@ final class VideoItem: ObservableObject, Identifiable {
     var meta: VideoMeta          // thumbnail may be upgraded after enrichment
     var id: UUID { meta.id }
 
-    @Published var status: DownloadStatus = .idle
+    /// Fires when *any* item changes status.
+    ///
+    /// Views that filter or count by status (sidebar badges, the status chips)
+    /// observe AppState, but status lives on VideoItem — so those counts only
+    /// refreshed when something unrelated on AppState happened to publish. This
+    /// closes that gap. Deliberately status-only: routing `progress` through here
+    /// would rebuild the whole list several times a second.
+    static let statusChanged = PassthroughSubject<Void, Never>()
+
+    @Published var status: DownloadStatus = .idle {
+        didSet { if oldValue != status { Self.statusChanged.send() } }
+    }
     @Published var progress: Double = 0        // 0...1
     @Published var statusLine: String = ""     // last human-readable line
     @Published var outputPath: String = ""     // final file once known
