@@ -46,29 +46,41 @@ the list, and in-flight work moves to an Activity popover in the toolbar.
 
 ## Data model changes
 
+As built (M1–M3 shipped; M4–M6 still projected):
+
 ```
-VideoMeta
-  + tier: .inbox | .collection      // promotion state
-  + addedAt / lastTouchedAt         // drives Inbox expiry
+VideoMeta                           // SHIPPED
+  + tier: .inbox | .kept            // promotion state
   + tags: [String]
   + collectionIDs: [UUID]
-  + localOnly: Bool                 // imported file, no remote source
-  + edit: EditRecipe?               // non-destructive, re-exportable
-  + probe: MediaInfo?               // from ffprobe (codec, bitrate, fps, tracks)
+  + importedPath: String?           // imported file, no remote source
+  + probe: MediaInfo?               // ffprobe: codec, bitrate, fps, tracks
+    receivedAt                      // already existed; drives Inbox expiry
+  + isLocal / filePath              // computed; branch on these, not downloadURL
 
-Collection { id, name, ordering: [UUID], exportSettings }
-EditRecipe { inPoint, outPoint, crop, rotate, speed, scale }
-Job { id, kind: .download|.export|.probe, progress, state, retry }
+VideoCollection { id, name, ordering: [UUID], createdAt }   // SHIPPED
+KeyCombo { keyCode, modifiers }                             // SHIPPED
+
+Job { id, itemID, title, kind, state, progress, detail }    // M4
+EditRecipe { inPoint, outPoint, crop, rotate, speed, scale } // M5
 ```
 
-`downloadURL` can no longer be assumed non-empty — imported local files have no
-remote source. Every path that reads it needs an audit.
+Two notes for anyone extending this:
+
+`downloadURL` can no longer be assumed non-empty — an imported file has no remote
+source. Branch on `isLocal`, not on `downloadURL.isEmpty`, which is *also* true
+for a malformed remote item.
+
+Every new persisted field needs `decodeIfPresent` in `VideoMeta.init(from:)`.
+Swift's synthesised `Decodable` throws on a missing key even when the property has
+a default, so forgetting this makes older libraries fail to load — and a failed
+load used to silently overwrite the file with `[]`.
 
 ---
 
 ## Milestones
 
-### M1 — Fast path (front-tab capture, menu bar, hotkey)
+### M1 — Fast path (front-tab capture, menu bar, hotkey) — **DONE**
 
 The smallest slice that proves the pivot, and independently shippable.
 
@@ -89,7 +101,11 @@ The smallest slice that proves the pivot, and independently shippable.
 **Outcome:** hotkey → front tab URL → downloading. No window, no paste, no
 extension. Firefox is the known gap (no AppleScript dictionary; needs AX).
 
-### M2 — Navigation restructure
+Shipped as described. The global shortcut ended up user-configurable (⌃⌥⌘D by
+default) with conflict reporting, since `RegisterEventHotKey` fails silently when
+another app already owns a combination.
+
+### M2 — Navigation restructure — **DONE**
 
 - Sidebar becomes Inbox / Recently Added / Collections / Smart Collections /
   Local Files. Collections section stays hidden until one exists.
@@ -98,14 +114,26 @@ extension. Firefox is the known gap (no AppleScript dictionary; needs AX).
 - Inbox expiry (library entry only) retires the "Clear all" button.
 - Demote extension setup out of onboarding into Settings.
 
-### M3 — Local files + inspector
+Also landed here: multi-select and batch actions, Settings as a real ⌘, window
+(the popover was cramming seven groups into 320pt), playback moved out of its
+blocking modal sheet into its own window, and the purple accent replaced by the
+system accent throughout. The onboarding backdrop is achromatic now — the old one
+was hardcoded dark with no light variant, so it rendered as a dark slab in a light
+window and degraded `.regularMaterial` cards into grey bricks.
+
+### M3 — Local files + inspector — **DONE**
 
 - Drag & drop, Add Files…, optional watch folder.
 - Wire up **ffprobe — already bundled and currently never called** — for
   duration, codec, bitrate, fps, and track listing.
 - Media inspector pane. Fixes thumbnails for local files for free.
 
-### M4 — Job system
+Imported files are referenced in place, never copied, and arrive `.kept` since
+importing is explicit. `VideoMeta.importedPath` broke the old invariant that every
+item has a remote source — `isLocal`/`filePath` exist to branch on rather than
+testing `downloadURL` for emptiness, which is also true of a malformed remote item.
+
+### M4 — Job system — **IN PROGRESS**
 
 - One `Job` model covering downloads, exports, and probes: progress, cancel,
   retry, history, concurrency control.
@@ -136,17 +164,28 @@ extension. Firefox is the known gap (no AppleScript dictionary; needs AX).
 
 ## Folded-in debt
 
-From the audit, fixed opportunistically inside the milestone that touches it:
+Fixed:
 
-- Download preferences are never persisted (M2 — settings rework).
-- Generated thumbnails in Application Support are never cleaned up (M2 — expiry).
-- `unpackExtension()` deletes the folder Chromium is actively loading from (M1 —
-  extension demotion).
-- `moveToApplications` destroys an existing install before the copy succeeds (M1).
-- Loopback server accepts any origin (`Access-Control-Allow-Origin: *`, no Host
-  check) and auto-spawns yt-dlp against attacker-supplied URLs (M1 — token +
-  origin allowlist, or removed with the extension).
-- Sidebar/list filters observe `AppState` but read `VideoItem` state (M2).
+- Download preferences were never persisted — reset on every launch.
+- Generated thumbnails were never cleaned up; `remove()` now prunes them.
+- Sidebar/list filters observed `AppState` but read `VideoItem` state, so counts
+  went stale. `VideoItem.statusChanged` is re-published throttled.
+- A library decode failure was indistinguishable from an empty library, and the
+  next save overwrote the file with `[]`. It now backs up and refuses to write.
+- Subprocess handling: unbounded blocking probes exhausting the dispatch thread
+  pool, an undrained ffmpeg stderr deadlocking exports, a lost race on yt-dlp's
+  final "Merging formats into" line, and a truncated JPEG rendering as a thin bar
+  because `NSImage(data:)` returns a usable object for a partial decode.
+
+Still outstanding:
+
+- **Loopback server accepts any origin** (`Access-Control-Allow-Origin: *`, no
+  Host check) and auto-spawns yt-dlp against URLs any visited page can supply.
+  Needs a token + origin allowlist, or removal along with the extension.
+- `unpackExtension()` deletes the folder Chromium is actively loading from.
+- `moveToApplications` destroys an existing install before the copy succeeds.
+- `toolSummary` never mentions ffprobe, so a missing one is unexplained.
+- ⌘A is registered scene-wide and may shadow select-all in the search field.
 
 ## Non-goals
 
