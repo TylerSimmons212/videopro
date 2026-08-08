@@ -133,14 +133,14 @@ importing is explicit. `VideoMeta.importedPath` broke the old invariant that eve
 item has a remote source — `isLocal`/`filePath` exist to branch on rather than
 testing `downloadURL` for emptiness, which is also true of a malformed remote item.
 
-### M4 — Job system — **IN PROGRESS**
+### M4 — Job system — **DONE**
 
 - One `Job` model covering downloads, exports, and probes: progress, cancel,
   retry, history, concurrency control.
 - Replaces the ad-hoc `activeDownloads` counter and the fire-and-forget export
   spinner. Structurally retires the class of bug behind the queue wedge.
 
-### M5 — Single-clip editor
+### M5 — Single-clip editor — **DONE**
 
 - Timeline scrubber with in/out handles, live preview, frame stepping,
   loop-the-selection. Replaces blind text-field time entry.
@@ -150,7 +150,13 @@ testing `downloadURL` for emptiness, which is also true of a malformed remote it
 - Chapters from yt-dlp `-J`: jump to them, export one as a clip, split by chapter.
 - Non-destructive: the `EditRecipe` persists and re-exports to multiple targets.
 
-### M6 — Collection builder
+Landed as described. Two findings worth keeping: `setpts` alone produces a
+stuttering low-frame-rate file when slowing down (nothing fills the stretched
+gaps, so 0.25× measured 7.5 fps) — an `fps` filter has to close it. And target
+framing must come *after* rotation, or rotating a 1080x1920 Reel frame yields
+1920x1080 and silently breaks the 9:16 guarantee.
+
+### M6 — Collection builder — **IN PROGRESS**
 
 **The Collection is the sequence** — no separate document model needed.
 
@@ -159,6 +165,39 @@ testing `downloadURL` for emptiness, which is also true of a malformed remote it
 - Constraint: ffmpeg's fast concat path needs identical codec parameters, so
   mixed sources must be normalised first. That's just the M5 export pipeline run
   per clip, which is why this composes rather than becoming an NLE.
+
+### M7 — On-device clip suggestions
+
+Depends on M5. **A suggested clip is just an `EditRecipe` with in/out set**, so
+this needs no new export path, job type, or persistence — it emits recipes and
+rides everything M4/M5 already do.
+
+Entirely on-device: `FoundationModels` (confirmed present in the macOS 27 SDK —
+`SystemLanguageModel`, `LanguageModelSession`, `@Generable` for structured
+output) plus `Speech` for transcription when there are no subtitles. Transcripts
+never leave the machine, which no cloud clipping tool can claim.
+
+- **Never let the model emit timestamps.** It will hallucinate them and produce
+  clips that start mid-syllable. Parse subtitles into numbered cues, feed the
+  model cue-indexed text, have it return *cue indices*, and map back to real times
+  ourselves. That also lands cuts on sentence boundaries for free.
+- **Cheap deterministic candidates first, model ranks and titles them.** Chapters
+  (already captured) are human-authored clip boundaries with no AI at all; ffmpeg
+  `select='gt(scene,0.4)'` gives visual cuts and `ebur128` finds laughter and
+  applause. A model that ranks a candidate list is far more robust than one asked
+  to find clips unaided.
+- **Query-driven beats taste-driven.** "Find where they discuss pricing" is
+  retrieval, which a small on-device model does well. "Find the best moments" is
+  judgement, which it does not. Ship the first; be sceptical of the second.
+- **Context window is a hard constraint** — the API has `exceededContextWindowSize`
+  and an hour of transcript will not fit. Needs map-reduce: score chunks, then a
+  second pass over the winners.
+- **Gate on availability** — `deviceNotEligible`, `appleIntelligenceNotEnabled`,
+  `modelNotReady` are all reachable. Degrade, don't break.
+
+Blocker to clear first: the download args already pass `--write-subs
+--write-auto-subs`, but `cleanupSidecars` **deletes the .srt files** after
+embedding them. Keep them, or re-extract from the container.
 
 ---
 
