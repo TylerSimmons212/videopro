@@ -386,11 +386,11 @@ final class DownloadManager {
 
     @MainActor
     func runFFmpeg(_ args: [String], item: VideoItem, label: String,
-                   completion: @escaping @MainActor (Bool) -> Void) {
+                   completion: @escaping @MainActor (Bool) -> Void) -> Cancel? {
         guard let ffmpeg = locate("ffmpeg") else {
             item.markError("ffmpeg not found — bundle it or `brew install ffmpeg`.")
             completion(false)
-            return
+            return nil
         }
         item.busy = true
         item.busyLabel = label
@@ -424,10 +424,26 @@ final class DownloadManager {
         do {
             try process.run()
         } catch {
+            out.fileHandleForReading.readabilityHandler = nil
+            err.fileHandleForReading.readabilityHandler = nil
             item.busy = false
             item.busyLabel = ""
             completion(false)
+            return nil
         }
+        // Handing the caller a way to stop this is what makes cancelling an export
+        // mean anything. Exports were previously unregistered entirely, so a
+        // cancelled job settled while ffmpeg carried on burning CPU to completion.
+        return Cancel { [weak process] in
+            guard let process, process.isRunning else { return }
+            process.terminate()
+        }
+    }
+
+    /// A one-shot stop handle for work that isn't tracked in `running` (which is
+    /// keyed by item id and so can't hold two jobs for the same video).
+    struct Cancel {
+        let stop: () -> Void
     }
 
     // MARK: - Generate a thumbnail with ffmpeg

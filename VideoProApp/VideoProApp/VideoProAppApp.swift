@@ -132,9 +132,9 @@ struct MenuBarContent: View {
             if let item = state.addURL(pasted) { state.download(item) }
         }
 
-        if state.activeDownloads + state.queuedCount > 0 {
+        if state.jobs.activeCount + state.jobs.queuedCount > 0 {
             Divider()
-            Text("\(state.activeDownloads) downloading, \(state.queuedCount) queued")
+            Text("\(state.jobs.activeCount) running, \(state.jobs.queuedCount) queued")
         }
 
         Divider()

@@ -623,17 +623,13 @@ struct LibraryView: View {
                 .popover(isPresented: $showAddURL, arrowEdge: .bottom) { addURLPopover }
 
             // In-flight work lives here now instead of taking two sidebar rows.
-            if state.activeDownloads + state.queuedCount > 0 {
-                Button { showActivity.toggle() } label: {
-                    Image(systemName: "arrow.down.circle")
-                        .symbolVariant(.fill)
-                        .foregroundStyle(.tint)
-                }
-                .help("Activity")
-                .popover(isPresented: $showActivity, arrowEdge: .bottom) {
-                    ActivityPopover().environmentObject(state)
-                }
+            // Always present now: it has a history worth opening even when idle.
+            Button { showActivity.toggle() } label: {
+                Image(systemName: "arrow.down.circle")
+                    .symbolVariant(state.jobs.activeCount > 0 ? .fill : .none)
             }
+            .help("Activity")
+            .popover(isPresented: $showActivity, arrowEdge: .bottom) { ActivityCenterView() }
 
             if scoped.contains(where: { $0.status == .idle || $0.status == .error }) {
                 Button { for i in visible where i.status == .idle || i.status == .error {
@@ -687,49 +683,6 @@ struct LibraryView: View {
         }
     }
 }
-
-/// What's running right now. Replaces the Downloading/Failed sidebar rows.
-struct ActivityPopover: View {
-    @EnvironmentObject var state: AppState
-
-    private var active: [VideoItem] {
-        state.items.filter { $0.status == .downloading || $0.status == .queued }
-    }
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack {
-                Text("Activity").font(.subheadline).fontWeight(.semibold)
-                Spacer()
-                Text("\(state.activeDownloads) of \(state.maxConcurrent)")
-                    .font(.caption).foregroundStyle(.secondary)
-            }
-            if active.isEmpty {
-                Text("Nothing in progress.").font(.caption).foregroundStyle(.secondary)
-            }
-            ForEach(active) { item in
-                VStack(alignment: .leading, spacing: 3) {
-                    HStack {
-                        Text(item.meta.title).font(.caption).lineLimit(1)
-                        Spacer()
-                        Button {
-                            state.cancel(item)
-                        } label: { Image(systemName: "xmark.circle.fill") }
-                            .buttonStyle(.plain).foregroundStyle(.secondary)
-                    }
-                    if item.status == .queued {
-                        Text("Queued").font(.caption2).foregroundStyle(.tertiary)
-                    } else {
-                        ProgressView(value: item.progress).progressViewStyle(.linear)
-                    }
-                }
-            }
-        }
-        .padding(14)
-        .frame(width: 300)
-    }
-}
-
 // MARK: - Backdrop
 
 /// Backdrop for full-bleed surfaces (onboarding).

@@ -48,11 +48,9 @@ final class AppState: ObservableObject {
     /// it. Surfaced in Settings; without it a taken shortcut just looks broken.
     @Published var hotKeyUnavailable = false
 
-    // Download queue
-    @Published var activeDownloads = 0
-    @Published var queuedCount = 0
-    private var pending: [(VideoItem, DownloadQuality)] = []
-    let maxConcurrent = 3
+    /// Mirrors JobCenter so views observing AppState still repaint when work
+    /// starts or finishes. The queue itself lives in JobCenter now.
+    let jobs = JobCenter.shared
 
     /// How many un-downloaded videos to pre-warm on launch. Each costs one
     /// `yt-dlp -J`, so this is a deliberate ceiling, not the whole library.
@@ -88,6 +86,17 @@ final class AppState: ObservableObject {
         VideoItem.statusChanged
             .throttle(for: .milliseconds(200), scheduler: RunLoop.main, latest: true)
             .sink { [weak self] in self?.objectWillChange.send() }
+            .store(in: &bag)
+
+        // `objectWillChange` fires *before* the mutation, so read the counts on the
+        // next runloop turn or the badge is always one event stale.
+        JobCenter.shared.objectWillChange
+            .receive(on: RunLoop.main)
+            .sink { [weak self] in
+                let n = JobCenter.shared.activeCount
+                NSApp.dockTile.badgeLabel = n > 0 ? "\(n)" : ""
+                self?.objectWillChange.send()
+            }
             .store(in: &bag)
     }
 
@@ -695,10 +704,32 @@ final class AppState: ObservableObject {
         // Nothing to fetch for a file that's already on disk.
         guard !item.meta.isLocal else { return }
         guard item.status != .downloading, item.status != .queued else { return }
+        let q = quality ?? defaultQuality
         item.status = .queued
         item.statusLine = "Queued…"
-        pending.append((item, quality ?? defaultQuality))
-        pump()
+
+        JobCenter.shared.enqueue(itemID: item.id, title: item.meta.title,
+                                 kind: .download(q)) { [weak self] job in
+            guard let self else { return false }
+            job.onCancel = { DownloadManager.shared.cancel(item) }
+            try? FileManager.default.createDirectory(at: self.downloadFolder,
+                                                     withIntermediateDirectories: true)
+            var opts = self.options
+            opts.quality = q
+            // Mirrored rather than pushed: DownloadManager already reports into the
+            // item, and keeping it unaware of jobs means the download path has one
+            // owner of progress instead of two that can disagree.
+            let progress = item.$progress.sink { job.progress = $0 }
+            let detail = item.$statusLine.sink { job.detail = $0 }
+            let ok = await withCheckedContinuation { cont in
+                DownloadManager.shared.download(item, into: self.downloadFolder,
+                                                options: opts) { cont.resume(returning: $0) }
+            }
+            progress.cancel()
+            detail.cancel()
+            if ok { self.onDownloadFinished(item) }
+            return ok
+        }
     }
 
     /// Queue every item that isn't already downloaded or in flight.
@@ -709,32 +740,15 @@ final class AppState: ObservableObject {
     }
 
     func cancel(_ item: VideoItem) {
-        // Remove from the pending queue if it hasn't started yet.
-        if let idx = pending.firstIndex(where: { $0.0.id == item.id }) {
-            pending.remove(at: idx)
+        guard let job = JobCenter.shared.active.first(where: { $0.itemID == item.id }) else { return }
+        let wasQueued = job.state == .queued
+        JobCenter.shared.cancel(job)
+        // A queued job's work never ran, so nothing has touched the item — put it
+        // back to idle rather than leaving it looking like a failure.
+        if wasQueued {
             item.status = .idle
             item.statusLine = ""
-            refreshCounts()
-            return
         }
-        DownloadManager.shared.cancel(item)
-    }
-
-    private func pump() {
-        while activeDownloads < maxConcurrent, !pending.isEmpty {
-            let (item, quality) = pending.removeFirst()
-            activeDownloads += 1
-            try? FileManager.default.createDirectory(at: downloadFolder, withIntermediateDirectories: true)
-            var opts = options
-            opts.quality = quality
-            DownloadManager.shared.download(item, into: downloadFolder, options: opts) { [weak self] ok in
-                guard let self else { return }
-                self.activeDownloads = max(0, self.activeDownloads - 1)
-                if ok { self.onDownloadFinished(item) }
-                self.pump()
-            }
-        }
-        refreshCounts()
     }
 
     private func onDownloadFinished(_ item: VideoItem) {
@@ -744,11 +758,6 @@ final class AppState: ObservableObject {
             saveLibrary()
         }
         notifyComplete(item)
-    }
-
-    private func refreshCounts() {
-        queuedCount = pending.count
-        NSApp.dockTile.badgeLabel = activeDownloads > 0 ? "\(activeDownloads)" : ""
     }
 
     // MARK: - Notifications
@@ -883,86 +892,100 @@ final class AppState: ObservableObject {
     /// into a temp dir, convert, then throw the temp away.
     /// `start`/`end` are in seconds; a non-positive `end` means "whole file".
     func export(_ item: VideoItem, kind: ExportKind, start: Double, end: Double) {
-        // Already downloaded → cut straight from disk, no network at all.
-        if hasLocalFile(item) {
-            let input = URL(fileURLWithPath: item.outputPath)
-            runExport(item, kind: kind, input: input,
-                      outputDir: input.deletingLastPathComponent(),
-                      start: start, end: end, preSliced: false, cleanup: nil)
-            return
-        }
-
-        guard !item.meta.downloadURL.isEmpty else {
+        guard hasLocalFile(item) || !item.meta.downloadURL.isEmpty else {
             alert("Nothing to export", "VideoPro doesn’t have a source URL for this video.")
             return
         }
-
-        let hasRange = kind.usesTimeRange && end > start && start >= 0
-        // MP3 needs no video track — grabbing audio-only saves a lot of bandwidth.
-        let format = (kind == .audio ? DownloadQuality.audioMP3 : DownloadQuality.bestMP4).format
-
-        item.busy = true
-        item.busyLabel = "Fetching source…"
-        let temp = FileManager.default.temporaryDirectory
-            .appendingPathComponent("VideoPro-export-\(item.id.uuidString)", isDirectory: true)
-
-        DownloadManager.shared.fetchSource(item, format: format,
-                                           range: hasRange ? (start, end) : nil,
-                                           into: temp) { [weak self] path in
-            guard let self else { return }
-            guard let path else {
-                item.busy = false
-                item.busyLabel = ""
-                try? FileManager.default.removeItem(at: temp)
-                self.alert("Couldn’t fetch this video",
-                           "VideoPro couldn’t retrieve a source to export from. DRM-protected videos can’t be exported.")
-                return
-            }
-            // yt-dlp already cut the section for us — don't cut it twice.
-            self.runExport(item, kind: kind, input: URL(fileURLWithPath: path),
-                           outputDir: self.downloadFolder,
-                           start: start, end: end, preSliced: hasRange, cleanup: temp)
+        JobCenter.shared.enqueue(itemID: item.id, title: item.meta.title,
+                                 kind: .export(kind)) { [weak self] job in
+            guard let self else { return false }
+            return await self.runExportJob(item, kind: kind, start: start, end: end, job: job)
         }
     }
 
-    /// The ffmpeg half of an export, shared by the local and fetched paths.
-    private func runExport(_ item: VideoItem, kind: ExportKind, input: URL, outputDir: URL,
-                           start: Double, end: Double, preSliced: Bool, cleanup: URL?) {
-        let stem = preSliced || input.lastPathComponent.hasPrefix("source.")
-            ? sanitizedStem(item.meta.title)
-            : input.deletingPathExtension().lastPathComponent
-        let out = uniqueURL(in: outputDir, name: stem + kind.suffix, ext: kind.fileExtension)
+    /// Fetch-if-needed then convert, as ONE job.
+    ///
+    /// Both halves live in the same job so the export lane genuinely serialises the
+    /// CPU-bound work — splitting them would let three ffmpeg encodes start the
+    /// moment three fetches happened to finish together, which is slower than
+    /// running them in sequence.
+    private func runExportJob(_ item: VideoItem, kind: ExportKind,
+                              start: Double, end: Double, job: Job) async -> Bool {
+        // ffmpeg reports no progress we parse today, so the bar stays indeterminate
+        // rather than pretending to know.
+        job.progress = -1
 
-        // If the source was fetched pre-sliced, it *is* the clip already — applying
-        // the range again would cut a range out of a range.
+        var input: URL
+        var outputDir: URL
+        var preSliced = false
+        var cleanup: URL?
+
+        if hasLocalFile(item), let path = item.meta.filePath ?? Optional(item.outputPath) {
+            input = URL(fileURLWithPath: path)
+            outputDir = input.deletingLastPathComponent()
+        } else {
+            job.detail = "Fetching source…"
+            let hasRange = kind.usesTimeRange && end > start && start >= 0
+            // MP3 needs no video track — grabbing audio-only saves a lot of bandwidth.
+            let format = (kind == .audio ? DownloadQuality.audioMP3 : DownloadQuality.bestMP4).format
+            let temp = FileManager.default.temporaryDirectory
+                .appendingPathComponent("VideoPro-export-\(item.id.uuidString)", isDirectory: true)
+            job.onCancel = { DownloadManager.shared.cancel(item) }
+
+            let fetched: String? = await withCheckedContinuation { cont in
+                DownloadManager.shared.fetchSource(item, format: format,
+                                                   range: hasRange ? (start, end) : nil,
+                                                   into: temp) { cont.resume(returning: $0) }
+            }
+            guard let fetched else {
+                try? FileManager.default.removeItem(at: temp)
+                job.detail = "Couldn’t fetch a source. DRM-protected videos can’t be exported."
+                return false
+            }
+            input = URL(fileURLWithPath: fetched)
+            outputDir = downloadFolder
+            preSliced = hasRange   // yt-dlp already cut it; don't cut a range out of a range
+            cleanup = temp
+        }
+
+        job.detail = "Exporting \(kind.rawValue)…"
+        let out = uniqueURL(in: outputDir,
+                            name: (preSliced || input.lastPathComponent.hasPrefix("source.")
+                                   ? sanitizedStem(item.meta.title)
+                                   : input.deletingPathExtension().lastPathComponent) + kind.suffix,
+                            ext: kind.fileExtension)
+
         let hasRange = !preSliced && kind.usesTimeRange && end > start && start >= 0
-        let dur = end - start
-
         var args = ["-y"]
         if hasRange { args += ["-ss", String(start)] }
         args += ["-i", input.path]
-        if hasRange { args += ["-t", String(dur)] }
-
+        if hasRange { args += ["-t", String(end - start)] }
         switch kind {
-        case .trim:
-            args += ["-c", "copy", "-avoid_negative_ts", "make_zero"]
-        case .gif:
-            args += ["-vf", "fps=12,scale=480:-1:flags=lanczos", "-loop", "0"]
-        case .audio:
-            args += ["-vn", "-c:a", "libmp3lame", "-q:a", "2"]
+        case .trim:  args += ["-c", "copy", "-avoid_negative_ts", "make_zero"]
+        case .gif:   args += ["-vf", "fps=12,scale=480:-1:flags=lanczos", "-loop", "0"]
+        case .audio: args += ["-vn", "-c:a", "libmp3lame", "-q:a", "2"]
         }
         args.append(out.path)
 
-        DownloadManager.shared.runFFmpeg(args, item: item, label: "Exporting \(kind.rawValue)…") { [weak self] ok in
-            guard let self else { return }
-            if let cleanup { try? FileManager.default.removeItem(at: cleanup) }
-            if ok {
-                NSWorkspace.shared.activateFileViewerSelecting([out])
-                self.notifyExportDone(item, kind: kind)
-            } else {
-                self.alert("Export failed", "ffmpeg couldn’t process this file.")
+        let ok = await withCheckedContinuation { cont in
+            let handle = DownloadManager.shared.runFFmpeg(args, item: item,
+                                                          label: "Exporting \(kind.rawValue)…") {
+                cont.resume(returning: $0)
             }
+            job.onCancel = { handle?.stop() }
         }
+
+        if let cleanup { try? FileManager.default.removeItem(at: cleanup) }
+        if ok {
+            NSWorkspace.shared.activateFileViewerSelecting([out])
+            notifyExportDone(item, kind: kind)
+        } else {
+            // No alert: the failure is visible in the Activity popover with a Retry
+            // button, and a modal for a background job interrupts whatever the user
+            // moved on to doing.
+            job.detail = "ffmpeg couldn’t process this file."
+        }
+        return ok
     }
 
     /// Filename-safe stem from a video title (temp sources are all "source.mp4").
