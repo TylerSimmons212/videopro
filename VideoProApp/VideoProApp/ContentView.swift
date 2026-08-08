@@ -792,7 +792,15 @@ struct VideoRow: View {
             Spacer(minLength: 4)
             controls.opacity(hovering || alwaysShowControls ? 1 : 0)
         }
-        .padding(.vertical, 5)
+        // Fixed, not intrinsic. A row's natural height depends on what enrichment
+        // has filled in so far — a fresh row is thumbnail-height, and once the
+        // pills and a status line arrive the text column overtakes the thumbnail
+        // and the row grows. Every row therefore resized underneath itself moments
+        // after being added, and while the insertion was still animating that
+        // showed up as rows overlapping each other. A library list wants uniform
+        // rows anyway; 64 clears the tallest case (three pills plus a status line).
+        .frame(height: 64)
+        .padding(.vertical, 4)
         .contentShape(.rect)
         .onHover { hovering = $0 }
         .onTapGesture(count: 2, perform: onPlay)
