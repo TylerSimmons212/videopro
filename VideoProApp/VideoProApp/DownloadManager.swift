@@ -370,10 +370,20 @@ final class DownloadManager {
         return base
     }
 
+    /// Formats we retain — and can actually parse. `.ass` and `.lrc` are
+    /// deliberately excluded: keeping a transcript nothing can read is worse than
+    /// keeping none, because it looks like the feature is broken rather than
+    /// unavailable.
+    static let retainableSubtitleExtensions: Set<String> = ["srt", "vtt"]
+
     /// The retained subtitle file for an item, if one was kept.
     static func subtitleFile(for id: UUID) -> URL? {
-        let url = subtitlesDirectory().appendingPathComponent("\(id.uuidString).srt")
-        return FileManager.default.fileExists(atPath: url.path) ? url : nil
+        let dir = subtitlesDirectory()
+        for ext in ["srt", "vtt"] {
+            let url = dir.appendingPathComponent("\(id.uuidString).\(ext)")
+            if FileManager.default.fileExists(atPath: url.path) { return url }
+        }
+        return nil
     }
 
     /// Keep one subtitle track, discard the rest.
@@ -390,7 +400,7 @@ final class DownloadManager {
         let url = URL(fileURLWithPath: mainFile)
         let dir = url.deletingLastPathComponent()
         let stem = url.deletingPathExtension().lastPathComponent
-        let subExts: Set<String> = ["srt", "vtt", "ass", "lrc"]
+        let subExts = Self.retainableSubtitleExtensions
         let fm = FileManager.default
         guard !stem.isEmpty,
               let entries = try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil)
@@ -414,8 +424,16 @@ final class DownloadManager {
         }
 
         if let best {
-            let dest = subtitlesDirectory().appendingPathComponent("\(id.uuidString).srt")
-            try? fm.removeItem(at: dest)
+            // Keep the REAL extension. This used to rename whatever it picked to
+            // ".srt" with no conversion, so a WebVTT file was stored under a name
+            // that lied about its format — fine for a parser that sniffs content,
+            // a trap for anything that trusts the path.
+            let ext = best.pathExtension.lowercased()
+            for stale in ["srt", "vtt"] {
+                try? fm.removeItem(at: subtitlesDirectory()
+                    .appendingPathComponent("\(id.uuidString).\(stale)"))
+            }
+            let dest = subtitlesDirectory().appendingPathComponent("\(id.uuidString).\(ext)")
             try? fm.moveItem(at: best, to: dest)
         }
         for entry in sidecars where entry != best {

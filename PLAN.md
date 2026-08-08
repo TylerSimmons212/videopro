@@ -202,9 +202,14 @@ never leave the machine, which no cloud clipping tool can claim.
 - **Gate on availability** — `deviceNotEligible`, `appleIntelligenceNotEnabled`,
   `modelNotReady` are all reachable. Degrade, don't break.
 
-Blocker to clear first: the download args already pass `--write-subs
---write-auto-subs`, but `cleanupSidecars` **deletes the .srt files** after
-embedding them. Keep them, or re-extract from the container.
+Prerequisite cleared: `DownloadManager.retainSubtitles` now keeps one parseable
+track per video (`.srt`/`.vtt` only — an unreadable `.ass` looks like a broken
+feature rather than an absent one), under its real extension.
+
+yt-dlp's auto-generated captions roll: each cue restates the tail of the previous
+one and appends a few words, so raw parsing yields ~3x the actual speech and blows
+the context budget. `Transcript` strips that by longest suffix/prefix overlap —
+guarded, because the same trick would eat real repeated speech on a human track.
 
 ---
 
