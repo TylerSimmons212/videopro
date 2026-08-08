@@ -5,14 +5,14 @@ import Combine
 
 enum JobKind: Equatable, Sendable {
     case download(DownloadQuality)
-    case export(ExportKind)
+    case export(ExportTarget)
 
     /// What the user is told this job is. Kept here so a row, a notification and
     /// a log line can never describe the same job differently.
     var label: String {
         switch self {
         case .download(let q): return "Download · \(q.rawValue)"
-        case .export(let k):   return "Export · \(k.rawValue)"
+        case .export(let t):   return "Export · \(t.displayName)"
         }
     }
 

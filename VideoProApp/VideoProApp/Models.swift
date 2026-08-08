@@ -49,6 +49,11 @@ struct VideoMeta: Codable, Equatable, Identifiable, Sendable {
     /// Chapter markers, when the source has them.
     var chapters: [VideoChapter] = []
 
+    /// The user's edit, kept rather than applied. Non-destructive: the source is
+    /// never modified, so the same recipe can be re-exported to several targets
+    /// and revised long after the fact.
+    var recipe: EditRecipe? = nil
+
     /// Decoded by hand so libraries written before these fields existed still
     /// load. Swift's synthesised `Decodable` throws on a missing key even when the
     /// property has a default, so every new field has to be `decodeIfPresent`.
@@ -74,6 +79,7 @@ struct VideoMeta: Codable, Equatable, Identifiable, Sendable {
         importedPath = try c.decodeIfPresent(String.self, forKey: .importedPath)
         probe = try c.decodeIfPresent(MediaInfo.self, forKey: .probe)
         chapters = try c.decodeIfPresent([VideoChapter].self, forKey: .chapters) ?? []
+        recipe = try c.decodeIfPresent(EditRecipe.self, forKey: .recipe)
     }
 
     init(title: String, pageURL: String, mediaURL: String, sourceKind: String,

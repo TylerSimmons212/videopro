@@ -53,6 +53,13 @@ enum ExportTarget: Equatable, Sendable, Identifiable, CaseIterable {
         }
     }
 
+    /// True when the plan needs the source's real bitrate/duration to hit a target
+    /// size — i.e. when it's worth paying for a probe before planning.
+    var isSizeTargeted: Bool {
+        if case .underSize = self { return true }
+        return false
+    }
+
     var fileExtension: String {
         switch self {
         case .mp4, .mp4Height, .reel, .underSize: return "mp4"

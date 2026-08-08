@@ -412,7 +412,7 @@ struct LibraryView: View {
         .navigationSubtitle(subtitle)
         .searchable(text: $search, placement: .toolbar, prompt: "Search videos")
         .toolbar { toolbarContent }
-        .sheet(item: $convertItem) { ConvertSheet(item: $0).environmentObject(state) }
+        .sheet(item: $convertItem) { EditorView(item: $0).environmentObject(state) }
     }
 
     private var title: String {
@@ -1018,90 +1018,141 @@ struct QualityPopover: View {
 
 // MARK: - Convert / trim
 
-struct ConvertSheet: View {
+/// Trim, transform and export a video.
+///
+/// Replaces a sheet with two text fields you typed times into blind — no
+/// scrubber, no preview, and a `parseTime` that silently returned 0 on a typo, so
+/// a mistyped range exported an empty file with no warning.
+struct EditorView: View {
     @EnvironmentObject var state: AppState
     @ObservedObject var item: VideoItem
     @Environment(\.dismiss) private var dismiss
 
-    @State private var kind: ExportKind = .trim
-    @State private var startText = "0:00"
-    @State private var endText = ""
+    @State private var player: AVPlayer?
+    @State private var recipe = EditRecipe.identity
+    @State private var targetID: String = ExportTarget.mp4.id
+    @State private var inPoint: Double = 0
+    @State private var outPoint: Double = 0
+    @State private var loopSelection = false
+    @State private var duration: Double = 0
+    @State private var resolving = true
+
+    private var fps: Double? { item.meta.probe?.video?.fps }
+    private var target: ExportTarget {
+        ExportTarget.allCases.first { $0.id == targetID } ?? .mp4
+    }
+    private var chapters: [TimelineChapter] {
+        item.meta.chapters.map { TimelineChapter(id: $0.id, title: $0.title, start: $0.start) }
+    }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            Text("Export").font(.title3).fontWeight(.bold)
-            Text(item.meta.title).font(.callout).foregroundStyle(.secondary).lineLimit(2)
-
-            Picker("Format", selection: $kind) {
-                ForEach(ExportKind.allCases) { Text($0.rawValue).tag($0) }
-            }
-            .pickerStyle(.segmented)
-
-            if kind.usesTimeRange {
-                HStack(spacing: 8) {
-                    VStack(alignment: .leading, spacing: 3) {
-                        Text("Start").font(.caption).foregroundStyle(.secondary)
-                        TextField("0:00", text: $startText).textFieldStyle(.roundedBorder).frame(width: 90)
-                    }
-                    Image(systemName: "arrow.right").foregroundStyle(.secondary).padding(.top, 14)
-                    VStack(alignment: .leading, spacing: 3) {
-                        Text("End").font(.caption).foregroundStyle(.secondary)
-                        TextField(endPlaceholder, text: $endText).textFieldStyle(.roundedBorder).frame(width: 90)
+        VStack(spacing: 0) {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(item.meta.title).font(.headline).lineLimit(1)
+                    if !item.meta.chapters.isEmpty {
+                        Text("\(item.meta.chapters.count) chapters")
+                            .font(.caption).foregroundStyle(.secondary)
                     }
                 }
-                Text(kind == .gif ? "Tip: keep GIFs short (a few seconds)." : "Leave End blank to go to the end.")
-                    .font(.caption2).foregroundStyle(.secondary)
+                Spacer()
+            }
+            .padding(14)
+
+            Divider()
+
+            if let player, duration > 0 {
+                TimelineView(player: player, duration: duration,
+                             inPoint: $inPoint, outPoint: $outPoint,
+                             chapters: chapters, fps: fps)
+                    .padding(.horizontal, 14).padding(.top, 10)
+                TransportControls(player: player, inPoint: $inPoint, outPoint: $outPoint,
+                                  loopSelection: $loopSelection, fps: fps)
+                    .padding(.horizontal, 14).padding(.bottom, 8)
             } else {
-                Text("Extracts the full audio track as an MP3.")
-                    .font(.caption).foregroundStyle(.secondary)
+                // A timeline needs a duration; without one there is nothing to scrub.
+                ContentUnavailableView(resolving ? "Preparing preview…" : "Can’t preview this video",
+                                       systemImage: resolving ? "clock" : "exclamationmark.triangle",
+                                       description: Text(resolving
+                                            ? "Reading the media."
+                                            : "VideoPro couldn’t resolve a playable stream to scrub."))
+                    .frame(height: 220)
             }
 
-            if !state.hasLocalFile(item) {
-                Label(sourceNote, systemImage: "arrow.down.circle")
-                    .font(.caption2).foregroundStyle(.secondary)
+            Divider()
+
+            HStack(spacing: 18) {
+                Picker("Rotate", selection: $recipe.rotation) {
+                    Text("None").tag(Rotation.none)
+                    Text("90° CW").tag(Rotation.cw90)
+                    Text("90° CCW").tag(Rotation.ccw90)
+                    Text("180°").tag(Rotation.half)
+                }
+                .frame(width: 150)
+
+                Picker("Speed", selection: $recipe.speed) {
+                    ForEach([0.25, 0.5, 1.0, 1.5, 2.0, 4.0], id: \.self) { v in
+                        Text(v == 1.0 ? "Normal" : "\(v.formatted(.number))×").tag(v)
+                    }
+                }
+                .frame(width: 150)
+
+                Toggle("Mirror", isOn: $recipe.flipHorizontal)
+                Toggle("Mute", isOn: $recipe.mute)
+                Spacer()
             }
+            .padding(.horizontal, 14).padding(.vertical, 10)
+
+            Divider()
 
             HStack {
+                Picker("Export as", selection: $targetID) {
+                    ForEach(ExportTarget.allCases) { Text($0.displayName).tag($0.id) }
+                }
+                .frame(width: 280)
                 Spacer()
                 Button("Cancel") { dismiss() }
                 Button("Export") {
-                    state.export(item, kind: kind,
-                                 start: parseTime(startText),
-                                 end: endText.isEmpty ? (item.meta.duration ?? 0) : parseTime(endText))
+                    var r = recipe
+                    // Only record bounds that actually trim, so an untouched
+                    // selection stays an identity recipe and can take the fast
+                    // remux path instead of a needless re-encode.
+                    r.inPoint = inPoint > 0.001 ? inPoint : nil
+                    r.outPoint = outPoint < duration - 0.001 ? outPoint : nil
+                    state.export(item, recipe: r, target: target)
                     dismiss()
                 }
                 .buttonStyle(.borderedProminent)
                 .keyboardShortcut(.defaultAction)
+                .disabled(outPoint <= inPoint)
             }
+            .padding(14)
         }
-        .padding(20)
-        .frame(width: 380)
+        .frame(width: 720)
+        .task { await prepare() }
+        .onDisappear { player?.pause() }
     }
 
-    private var endPlaceholder: String {
-        if let d = item.meta.prettyDuration { return d }
-        return "end"
-    }
+    private func prepare() async {
+        recipe = item.meta.recipe ?? .identity
 
-    /// This video isn't downloaded, so say what we'll pull down for the export.
-    private var sourceNote: String {
-        switch kind {
-        case .audio: return "Not downloaded — VideoPro will fetch the audio track only."
-        case .trim, .gif:
-            return endText.isEmpty
-                ? "Not downloaded — VideoPro will fetch the video first."
-                : "Not downloaded — VideoPro will fetch just this section."
-        }
-    }
+        // Prefer bytes on disk, then a warm stream, then resolve one — an
+        // un-downloaded video is still editable, since the export fetches only the
+        // section it needs.
+        var url = item.meta.filePath.map { URL(fileURLWithPath: $0) }
+        if url == nil { url = item.warmPlayURL }
+        if url == nil { url = await DownloadManager.shared.resolvePlayableURL(for: item.meta) }
+        guard let url else { resolving = false; return }
 
-    private func parseTime(_ s: String) -> Double {
-        let parts = s.split(separator: ":").map { Double($0) ?? 0 }
-        switch parts.count {
-        case 3: return parts[0] * 3600 + parts[1] * 60 + parts[2]
-        case 2: return parts[0] * 60 + parts[1]
-        case 1: return parts[0]
-        default: return 0
-        }
+        let asset = AVURLAsset(url: url)
+        let loaded = (try? await asset.load(.duration).seconds) ?? item.meta.duration ?? 0
+        guard loaded.isFinite, loaded > 0 else { resolving = false; return }
+
+        duration = loaded
+        inPoint = recipe.inPoint ?? 0
+        outPoint = recipe.outPoint ?? loaded
+        player = AVPlayer(playerItem: AVPlayerItem(asset: asset))
+        resolving = false
     }
 }
 

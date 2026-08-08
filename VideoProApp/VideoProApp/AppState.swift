@@ -895,50 +895,58 @@ final class AppState: ObservableObject {
     /// needs (just the requested section for a clip/GIF, audio-only for MP3)
     /// into a temp dir, convert, then throw the temp away.
     /// `start`/`end` are in seconds; a non-positive `end` means "whole file".
-    func export(_ item: VideoItem, kind: ExportKind, start: Double, end: Double) {
+    /// Export `item` through `recipe` to `target`.
+    ///
+    /// The recipe is persisted rather than applied — the source is never modified,
+    /// so the same edit can be re-exported to several targets later.
+    func export(_ item: VideoItem, recipe: EditRecipe, target: ExportTarget) {
         guard hasLocalFile(item) || !item.meta.downloadURL.isEmpty else {
             alert("Nothing to export", "VideoPro doesn’t have a source URL for this video.")
             return
         }
+        if item.meta.recipe != recipe {
+            item.meta.recipe = recipe
+            promote(item)        // editing is intent
+            saveLibrary()
+        }
         JobCenter.shared.enqueue(itemID: item.id, title: item.meta.title,
-                                 kind: .export(kind)) { [weak self] job in
+                                 kind: .export(target)) { [weak self] job in
             guard let self else { return false }
-            return await self.runExportJob(item, kind: kind, start: start, end: end, job: job)
+            return await self.runExportJob(item, recipe: recipe, target: target, job: job)
         }
     }
 
-    /// Fetch-if-needed then convert, as ONE job.
+    /// Fetch-if-needed, then run the plan's passes in order, as ONE job.
     ///
-    /// Both halves live in the same job so the export lane genuinely serialises the
-    /// CPU-bound work — splitting them would let three ffmpeg encodes start the
-    /// moment three fetches happened to finish together, which is slower than
+    /// Both halves share a job so the export lane genuinely serialises the
+    /// CPU-bound work — splitting them would let several ffmpeg encodes start the
+    /// moment their fetches happened to finish together, which is slower than
     /// running them in sequence.
-    private func runExportJob(_ item: VideoItem, kind: ExportKind,
-                              start: Double, end: Double, job: Job) async -> Bool {
-        // ffmpeg reports no progress we parse today, so the bar stays indeterminate
-        // rather than pretending to know.
+    private func runExportJob(_ item: VideoItem, recipe: EditRecipe,
+                              target: ExportTarget, job: Job) async -> Bool {
+        // ffmpeg's progress output isn't parsed today, so the bar stays honest
+        // about not knowing rather than inventing a number.
         job.progress = -1
 
+        var effective = recipe
         var input: URL
         var outputDir: URL
-        var preSliced = false
         var cleanup: URL?
 
-        if hasLocalFile(item), let path = item.meta.filePath ?? Optional(item.outputPath) {
+        if hasLocalFile(item), let path = item.meta.filePath ?? (item.outputPath.isEmpty ? nil : item.outputPath) {
             input = URL(fileURLWithPath: path)
             outputDir = input.deletingLastPathComponent()
         } else {
             job.detail = "Fetching source…"
-            let hasRange = kind.usesTimeRange && end > start && start >= 0
-            // MP3 needs no video track — grabbing audio-only saves a lot of bandwidth.
-            let format = (kind == .audio ? DownloadQuality.audioMP3 : DownloadQuality.bestMP4).format
+            let hasRange = recipe.inPoint != nil || recipe.outPoint != nil
+            let range = hasRange ? (recipe.inPoint ?? 0, recipe.outPoint ?? .greatestFiniteMagnitude) : nil
+            let format = (target == .audioMP3 ? DownloadQuality.audioMP3 : DownloadQuality.bestMP4).format
             let temp = FileManager.default.temporaryDirectory
                 .appendingPathComponent("VideoPro-export-\(item.id.uuidString)", isDirectory: true)
             job.onCancel = { DownloadManager.shared.cancel(item) }
 
             let fetched: String? = await withCheckedContinuation { cont in
-                DownloadManager.shared.fetchSource(item, format: format,
-                                                   range: hasRange ? (start, end) : nil,
+                DownloadManager.shared.fetchSource(item, format: format, range: range,
                                                    into: temp) { cont.resume(returning: $0) }
             }
             guard let fetched else {
@@ -948,45 +956,59 @@ final class AppState: ObservableObject {
             }
             input = URL(fileURLWithPath: fetched)
             outputDir = downloadFolder
-            preSliced = hasRange   // yt-dlp already cut it; don't cut a range out of a range
             cleanup = temp
-        }
-
-        job.detail = "Exporting \(kind.rawValue)…"
-        let out = uniqueURL(in: outputDir,
-                            name: (preSliced || input.lastPathComponent.hasPrefix("source.")
-                                   ? sanitizedStem(item.meta.title)
-                                   : input.deletingPathExtension().lastPathComponent) + kind.suffix,
-                            ext: kind.fileExtension)
-
-        let hasRange = !preSliced && kind.usesTimeRange && end > start && start >= 0
-        var args = ["-y"]
-        if hasRange { args += ["-ss", String(start)] }
-        args += ["-i", input.path]
-        if hasRange { args += ["-t", String(end - start)] }
-        switch kind {
-        case .trim:  args += ["-c", "copy", "-avoid_negative_ts", "make_zero"]
-        case .gif:   args += ["-vf", "fps=12,scale=480:-1:flags=lanczos", "-loop", "0"]
-        case .audio: args += ["-vn", "-c:a", "libmp3lame", "-q:a", "2"]
-        }
-        args.append(out.path)
-
-        let ok = await withCheckedContinuation { cont in
-            let handle = DownloadManager.shared.runFFmpeg(args, item: item,
-                                                          label: "Exporting \(kind.rawValue)…") {
-                cont.resume(returning: $0)
+            // yt-dlp already cut the section, so drop ONLY the trim from the recipe.
+            // Zeroing the whole thing here would silently discard crop, rotation,
+            // speed and scale — everything else the user asked for.
+            if hasRange {
+                effective.inPoint = nil
+                effective.outPoint = nil
             }
-            job.onCancel = { handle?.stop() }
         }
 
+        // The planner needs real dimensions to turn a normalised crop into pixels,
+        // and the source bitrate to size a two-pass encode.
+        var source = item.meta.probe
+        if source == nil, effective.crop != nil || target.isSizeTargeted {
+            source = await MediaProbe.shared.probe(path: input.path)
+        }
+
+        let stem = input.lastPathComponent.hasPrefix("source.")
+            ? sanitizedStem(item.meta.title)
+            : input.deletingPathExtension().lastPathComponent
+        let out = uniqueURL(in: outputDir, name: stem + "_edit", ext: target.fileExtension)
+
+        let plan = ExportPlan.make(input: input, output: out, recipe: effective,
+                                   target: target, source: source)
+
+        var ok = true
+        for (index, args) in plan.passes.enumerated() {
+            job.detail = plan.passes.count > 1
+                ? "Exporting \(target.displayName)… (pass \(index + 1) of \(plan.passes.count))"
+                : "Exporting \(target.displayName)…"
+            ok = await withCheckedContinuation { cont in
+                let handle = DownloadManager.shared.runFFmpeg(args, item: item,
+                                                              label: job.detail) {
+                    cont.resume(returning: $0)
+                }
+                job.onCancel = { handle?.stop() }
+            }
+            // Fail fast: a failed pass invalidates everything after it, and pass 2
+            // of a two-pass encode reads statistics pass 1 never wrote.
+            if !ok { break }
+        }
+
+        // Always clear the scratch: a surviving x264 pass log would be picked up by
+        // the *next* export and target a bitrate computed for a different clip.
+        for scratch in plan.scratchFiles { try? FileManager.default.removeItem(at: scratch) }
         if let cleanup { try? FileManager.default.removeItem(at: cleanup) }
+
         if ok {
-            NSWorkspace.shared.activateFileViewerSelecting([out])
-            notifyExportDone(item, kind: kind)
+            NSWorkspace.shared.activateFileViewerSelecting([plan.outputURL])
+            notifyExportDone(item, target: target)
         } else {
-            // No alert: the failure is visible in the Activity popover with a Retry
-            // button, and a modal for a background job interrupts whatever the user
-            // moved on to doing.
+            // No modal: the failure is in the Activity popover with a Retry button,
+            // and a modal for background work interrupts whatever the user moved on to.
             job.detail = "ffmpeg couldn’t process this file."
         }
         return ok
@@ -1011,10 +1033,10 @@ final class AppState: ObservableObject {
         return candidate
     }
 
-    private func notifyExportDone(_ item: VideoItem, kind: ExportKind) {
+    private func notifyExportDone(_ item: VideoItem, target: ExportTarget) {
         let content = UNMutableNotificationContent()
         content.title = "Export complete"
-        content.body = "\(kind.rawValue) · \(item.meta.title)"
+        content.body = "\(target.displayName) · \(item.meta.title)"
         content.sound = .default
         let req = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
         UNUserNotificationCenter.current().add(req)
