@@ -46,6 +46,9 @@ struct VideoMeta: Codable, Equatable, Identifiable, Sendable {
     /// and the answer can't change unless the file does.
     var probe: MediaInfo? = nil
 
+    /// Chapter markers, when the source has them.
+    var chapters: [VideoChapter] = []
+
     /// Decoded by hand so libraries written before these fields existed still
     /// load. Swift's synthesised `Decodable` throws on a missing key even when the
     /// property has a default, so every new field has to be `decodeIfPresent`.
@@ -70,6 +73,7 @@ struct VideoMeta: Codable, Equatable, Identifiable, Sendable {
         collectionIDs = try c.decodeIfPresent([UUID].self, forKey: .collectionIDs) ?? []
         importedPath = try c.decodeIfPresent(String.self, forKey: .importedPath)
         probe = try c.decodeIfPresent(MediaInfo.self, forKey: .probe)
+        chapters = try c.decodeIfPresent([VideoChapter].self, forKey: .chapters) ?? []
     }
 
     init(title: String, pageURL: String, mediaURL: String, sourceKind: String,
@@ -153,6 +157,18 @@ struct VideoMeta: Codable, Equatable, Identifiable, Sendable {
             .lowercased() else { return false }
         return platformHosts.contains(where: { host == $0 || host.hasSuffix("." + $0) })
     }
+}
+
+/// A chapter marker. yt-dlp returns these in `-J` for most platform videos and
+/// we were discarding them — they're the cheapest way to make a long video
+/// navigable, and each one is a ready-made clip boundary.
+struct VideoChapter: Codable, Equatable, Sendable, Identifiable {
+    var id: UUID = UUID()
+    var title: String
+    var start: Double
+    var end: Double?
+
+    private enum CodingKeys: String, CodingKey { case id, title, start, end }
 }
 
 // MARK: - Collections

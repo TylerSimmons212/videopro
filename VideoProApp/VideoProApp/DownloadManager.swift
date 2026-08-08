@@ -526,6 +526,7 @@ final class DownloadManager {
         var duration: Double?
         var heights: [Int]
         var playURL: String?     // a muxed stream AVPlayer can open directly
+        var chapters: [VideoChapter] = []
     }
 
     /// Signed CDN URLs (googlevideo & friends) are time-limited. Trust the URL's
@@ -572,12 +573,23 @@ final class DownloadManager {
             if let h = f["height"] as? Int, h > 0 { set.insert(h) }
         }
         if let h = json["height"] as? Int, h > 0 { set.insert(h) }
+        // yt-dlp gives chapters as {start_time, end_time, title}; a video with none
+        // simply omits the key.
+        let chapters: [VideoChapter] = ((json["chapters"] as? [[String: Any]]) ?? [])
+            .compactMap { c in
+                guard let start = c["start_time"] as? Double else { return nil }
+                let title = (c["title"] as? String) ?? ""
+                return VideoChapter(title: title.isEmpty ? "Chapter" : title,
+                                    start: start, end: c["end_time"] as? Double)
+            }
+
         return VideoInfo(
             thumbnail: json["thumbnail"] as? String,
             title: json["title"] as? String,
             duration: json["duration"] as? Double,
             heights: set.sorted(by: >),
-            playURL: pickProgressiveURL(formats: formats, json: json)
+            playURL: pickProgressiveURL(formats: formats, json: json),
+            chapters: chapters
         )
     }
 

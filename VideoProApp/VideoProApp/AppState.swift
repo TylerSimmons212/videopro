@@ -811,6 +811,10 @@ final class AppState: ObservableObject {
                     saveLibrary()
                 }
                 item.availableHeights = info.heights
+                if !info.chapters.isEmpty, item.meta.chapters != info.chapters {
+                    item.meta.chapters = info.chapters
+                    saveLibrary()
+                }
 
                 // Backfill a duration the extension couldn't read (MSE/blob players).
                 if item.meta.duration == nil, let d = info.duration, d > 0 {
