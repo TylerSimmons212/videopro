@@ -251,7 +251,15 @@ struct DownloadOptions: Sendable {
     var quality: DownloadQuality = .bestMP4
     var embedThumbnail: Bool = true
     var embedSubtitles: Bool = true
-    var subtitleLanguages: String = "en.*,en"
+    /// Deliberately explicit rather than `en.*`.
+    ///
+    /// `en.*` looks like "English and its regional variants", but yt-dlp treats it
+    /// as a regex, so it also matches YouTube's translated auto-captions —
+    /// `en-de` is "English FROM German", not a variant. YouTube now offers those
+    /// for essentially every language pair, so the glob pulled several tracks,
+    /// tripped rate limiting, and the resulting `HTTP 429` aborted the whole
+    /// download, video included.
+    var subtitleLanguages: String = "en,en-orig"
 
     static let `default` = DownloadOptions()
 }

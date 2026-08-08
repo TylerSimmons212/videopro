@@ -133,6 +133,9 @@ final class DownloadManager {
                 args += [
                     "--write-subs", "--write-auto-subs",
                     "--sub-langs", options.subtitleLanguages,
+                    // Pace the subtitle requests: several in quick succession is
+                    // what earns a 429, and a failed subtitle aborts the video too.
+                    "--sleep-subtitles", "1",
                     "--embed-subs", "--convert-subs", "srt",
                 ]
             }
@@ -438,6 +441,57 @@ final class DownloadManager {
         }
         for entry in sidecars where entry != best {
             try? fm.removeItem(at: entry)
+        }
+    }
+
+    /// Pull an embedded subtitle track out of a container.
+    ///
+    /// Downloads made before subtitles were retained have their captions muxed
+    /// into the file and no sidecar, so without this the clip finder is dark on
+    /// every video already in someone's library.
+    func extractSubtitles(from path: String, id: UUID) async -> URL? {
+        guard let ffmpeg = locate("ffmpeg"),
+              FileManager.default.fileExists(atPath: path) else { return nil }
+        let out = Self.subtitlesDirectory().appendingPathComponent("\(id.uuidString).srt")
+
+        return await withCheckedContinuation { continuation in
+            probeQueue.addOperation {
+                let process = Process()
+                process.executableURL = URL(fileURLWithPath: ffmpeg)
+                // First subtitle stream only, converted to srt. Fails cleanly when
+                // the file has no subtitle stream at all, which is the common case.
+                process.arguments = ["-y", "-nostdin", "-i", path,
+                                     "-map", "0:s:0", "-c:s", "srt", out.path]
+                let sink = Pipe(), errSink = Pipe()
+                process.standardOutput = sink
+                process.standardError = errSink
+                let drain: @Sendable (FileHandle) -> Void = { _ = $0.availableData }
+                sink.fileHandleForReading.readabilityHandler = drain
+                errSink.fileHandleForReading.readabilityHandler = drain
+
+                var done = false
+                let lock = NSLock()
+                func finish(_ value: URL?) {
+                    lock.lock(); defer { lock.unlock() }
+                    if done { return }
+                    done = true
+                    sink.fileHandleForReading.readabilityHandler = nil
+                    errSink.fileHandleForReading.readabilityHandler = nil
+                    continuation.resume(returning: value)
+                }
+                self.timerQueue.asyncAfter(deadline: .now() + 30) { [weak process] in
+                    if let process, process.isRunning { process.terminate() }
+                }
+                do {
+                    try process.run()
+                    process.waitUntilExit()
+                    let ok = process.terminationStatus == 0
+                        && FileManager.default.fileExists(atPath: out.path)
+                    finish(ok ? out : nil)
+                } catch {
+                    finish(nil)
+                }
+            }
         }
     }
 

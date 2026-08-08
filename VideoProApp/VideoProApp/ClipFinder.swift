@@ -118,12 +118,18 @@ struct ClipFinderView: View {
     }
 
     private func run(query: String?) {
-        guard let transcript = state.transcript(for: item) else { return }
         working = true
         message = nil
         searched = true
         Task {
             defer { working = false }
+            // Extraction can take a moment on a long file, so it happens here
+            // rather than behind the menu item that opened this sheet.
+            guard let transcript = await state.transcript(for: item) else {
+                clips = []
+                message = "No subtitles found in this video. Re-download it with “Embed subtitles” turned on."
+                return
+            }
             do {
                 let found: [SuggestedClip]
                 if let query, !query.trimmingCharacters(in: .whitespaces).isEmpty {
