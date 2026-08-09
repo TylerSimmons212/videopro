@@ -325,18 +325,37 @@ final class AppState: ObservableObject {
     /// If we're running from a DMG or Downloads, offer to move to /Applications
     /// (also required for Safari to load the extension). If already installed,
     /// offer to eject leftover installer disk images.
+    /// Is macOS running us from a randomised read-only copy?
+    ///
+    /// Opening a quarantined app straight from a DMG triggers App Translocation:
+    /// the app executes from /private/var/…/AppTranslocation/<uuid>/d/, not from
+    /// where the user thinks it lives. That path is randomised per launch, so TCC
+    /// can't record a stable identity for us — Automation prompts don't stick and
+    /// **no entry ever appears in Privacy & Security → Automation**, leaving the
+    /// user staring at a list they can't add to. Nothing in-app can fix it; the
+    /// bundle has to be moved to a real location and reopened.
+    var isTranslocated: Bool {
+        Bundle.main.bundlePath.contains("/AppTranslocation/")
+    }
+
     func checkInstallLocation() {
         let path = Bundle.main.bundlePath
         if path.hasPrefix("/Applications/") {
             offerEjectInstallers()
             return
         }
-        // Only nudge real distributions — never dev builds (DerivedData/Xcode).
-        guard path.hasPrefix("/Volumes/") || path.contains("/Downloads/") else { return }
+        // Translocation is checked first and separately: the path looks nothing
+        // like a DMG or Downloads, so the location tests below all miss it.
+        guard isTranslocated || path.hasPrefix("/Volumes/") || path.contains("/Downloads/")
+        else { return }   // never nudge dev builds (DerivedData/Xcode)
 
         let a = NSAlert()
-        a.messageText = "Move VideoPro to Applications?"
-        a.informativeText = "VideoPro should live in your Applications folder. Safari also needs it there to load the extension."
+        a.messageText = isTranslocated
+            ? "Move VideoPro to Applications to finish setup"
+            : "Move VideoPro to Applications?"
+        a.informativeText = isTranslocated
+            ? "macOS is running VideoPro from a temporary copy, which stops it asking for permission to read your browser’s tab — the Automation list stays empty and there’s nothing to switch on. Moving it to Applications fixes that."
+            : "VideoPro should live in your Applications folder. Safari also needs it there to load the extension."
         a.addButton(withTitle: "Move to Applications")
         a.addButton(withTitle: "Not Now")
         guard a.runModal() == .alertFirstButtonReturn else { return }
@@ -459,19 +478,65 @@ final class AppState: ObservableObject {
             download(item)
         } catch let error as FrontTab.Failure {
             if error.isPermission {
-                // No API can re-prompt once Automation has been denied, so an
-                // alert that routes to Settings is the only way back.
-                let a = NSAlert()
-                a.messageText = error.errorDescription ?? "Permission needed"
-                a.informativeText = "Turn VideoPro on under Privacy & Security → Automation, then try again."
-                a.addButton(withTitle: "Open Settings")
-                a.addButton(withTitle: "Cancel")
-                if a.runModal() == .alertFirstButtonReturn { FrontTab.openAutomationSettings() }
+                presentAutomationDenied(error)
             } else {
                 notify("Couldn’t grab the tab", error.errorDescription ?? "Unknown error")
             }
         } catch {
             notify("Couldn’t grab the tab", error.localizedDescription)
+        }
+    }
+
+    /// Explain an Automation denial in terms the user can act on.
+    ///
+    /// "Turn it on in Settings" is useless advice when there is no switch to turn
+    /// on, and that is the common case: the Automation pane only lists apps that
+    /// have already prompted, so a denial that happened before any prompt leaves
+    /// the list empty. There are exactly two real remedies, and which one applies
+    /// is knowable, so say the right one rather than the generic one.
+    private func presentAutomationDenied(_ error: FrontTab.Failure) {
+        let a = NSAlert()
+        a.messageText = error.errorDescription ?? "Permission needed"
+
+        if isTranslocated {
+            a.informativeText = """
+            macOS is running VideoPro from a temporary copy, so it can’t ask for \
+            permission and nothing appears in the Automation list.
+
+            Move VideoPro to your Applications folder and open it from there.
+            """
+            a.addButton(withTitle: "Move to Applications")
+            a.addButton(withTitle: "Cancel")
+            if a.runModal() == .alertFirstButtonReturn {
+                moveToApplications(from: Bundle.main.bundlePath)
+            }
+            return
+        }
+
+        a.informativeText = """
+        If VideoPro is listed under Privacy & Security → Automation, switch on the \
+        browser you want it to read.
+
+        If it isn’t listed, macOS never recorded the request — ask again to bring \
+        the permission prompt back.
+        """
+        a.addButton(withTitle: "Ask Again")
+        a.addButton(withTitle: "Open Settings")
+        a.addButton(withTitle: "Cancel")
+        switch a.runModal() {
+        case .alertFirstButtonReturn:
+            // Clears only our own Automation decisions, which is what makes macOS
+            // prompt afresh. Same thing the user would type by hand.
+            let p = Process()
+            p.executableURL = URL(fileURLWithPath: "/usr/bin/tccutil")
+            p.arguments = ["reset", "AppleEvents", Bundle.main.bundleIdentifier ?? "com.videopro.app"]
+            p.standardOutput = Pipe(); p.standardError = Pipe()
+            try? p.run(); p.waitUntilExit()
+            grabFrontTab()   // retry immediately; macOS should prompt this time
+        case .alertSecondButtonReturn:
+            FrontTab.openAutomationSettings()
+        default:
+            break
         }
     }
 
