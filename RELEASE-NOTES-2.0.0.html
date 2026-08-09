@@ -1,0 +1,80 @@
+<html><head><meta charset="utf-8"><style>
+body{font:13px -apple-system,system-ui;margin:14px;line-height:1.5}
+h1{font-size:16px;margin:0 0 4px}h2{font-size:13px;margin:16px 0 4px}
+ul{margin:4px 0;padding-left:20px}li{margin:3px 0}code{font-size:12px}
+</style></head><body>
+<h1>VideoPro 2.0.0</h1>
+<p>VideoPro is now an app first. The browser extension still works, but it&#x27;s</p>
+<p>optional — everything it did, the app now does on its own.</p>
+<h2>Grab a video without opening the window</h2>
+<ul>
+<li><strong>Global shortcut (⌃⌥⌘D)</strong> — press it anywhere and VideoPro downloads whatever</li>
+</ul>
+<p>  is playing in the browser you were last in. Customisable in Settings.</p>
+<ul>
+<li><strong>Menu bar item</strong> for the same thing with one click, plus paste-and-download.</li>
+<li><strong>Sign-in cookies</strong> (opt-in) so private, members-only and age-restricted videos</li>
+</ul>
+<p>  work without the extension.</p>
+<h2>A library that tidies itself</h2>
+<ul>
+<li><strong>Inbox</strong> — new videos land here and clear themselves after a while. Your files</li>
+</ul>
+<p>  are never touched, only the list entry. No more clearing out one-off grabs.</p>
+<ul>
+<li><strong>Collections</strong> — anything you act on is kept automatically. Group videos,</li>
+</ul>
+<p>  reorder them, and join a whole collection into one video.</p>
+<ul>
+<li><strong>Search, sort, multi-select</strong> and batch actions across the library.</li>
+<li>Sidebar now holds places rather than status filters; status became chips, and</li>
+</ul>
+<p>  in-progress work moved to an Activity popover with cancel, retry and history.</p>
+<h2>Your own files</h2>
+<ul>
+<li><strong>Drag videos in</strong>, or import them — referenced where they sit, never copied.</li>
+<li><strong>Media inspector</strong> showing codec, bitrate, frame rate and every audio and</li>
+</ul>
+<p>  subtitle track.</p>
+<ul>
+<li>Editing no longer requires downloading first.</li>
+</ul>
+<h2>A real editor</h2>
+<ul>
+<li><strong>Timeline</strong> with draggable in/out handles, live preview, frame stepping and</li>
+</ul>
+<p>  loop-the-selection — replacing two text fields you typed times into blind.</p>
+<ul>
+<li><strong>Crop, rotate, speed, mirror and mute</strong>, kept as a recipe rather than applied,</li>
+</ul>
+<p>  so your edit survives and can be re-exported.</p>
+<ul>
+<li><strong>Export presets</strong>: MP4, 1080p, 720p, Reel/Short (9:16), GIF, MP3, ProRes, and</li>
+</ul>
+<p>  &quot;under N MB&quot; via a real two-pass encode.</p>
+<ul>
+<li><strong>Chapters</strong> from the source are marked on the timeline.</li>
+<li>GIFs use a proper generated palette and look markedly better.</li>
+</ul>
+<h2>Fixes</h2>
+<ul>
+<li><strong>Downloads no longer stop after a while.</strong> A stalled transfer used to hold its</li>
+</ul>
+<p>  slot forever and three of them wedged the queue for the session. Transfers are</p>
+<p>  now watched and released, and the queue can&#x27;t be stranded by one stuck job.</p>
+<ul>
+<li><strong>Exports can be cancelled and retried</strong>, and no longer hang on long jobs.</li>
+<li><strong>YouTube subtitles work again.</strong> The language pattern was matching YouTube&#x27;s</li>
+</ul>
+<p>  translated auto-captions, which triggered rate limiting and aborted the whole</p>
+<p>  download — video included.</p>
+<ul>
+<li>Downloads that needed merging no longer lose track of the finished file.</li>
+<li>Broken thumbnails no longer render as a thin coloured bar.</li>
+<li>Download preferences now persist between launches.</li>
+<li>Player opens in its own window instead of blocking the app.</li>
+<li>Settings is a proper window (⌘,) instead of a cramped popover.</li>
+</ul>
+<h2>Privacy</h2>
+<p>VideoPro no longer listens on a local port unless you turn the browser extension</p>
+<p>on. If you already use the extension, nothing changes.</p></body></html>

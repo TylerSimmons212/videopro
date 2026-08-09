@@ -175,6 +175,16 @@ FEEDDIR="$DIST/feed"
 rm -rf "$FEEDDIR"; mkdir -p "$FEEDDIR"
 cp "$DMG" "$FEEDDIR/VideoPro-$VERSION.dmg"
 
+# Sparkle embeds <archive-basename>.html as the update's release notes. Without
+# it the update prompt shows a bare version number and nothing about what changed.
+NOTES="$ROOT/RELEASE-NOTES-$VERSION.html"
+if [ -f "$NOTES" ]; then
+  cp "$NOTES" "$FEEDDIR/VideoPro-$VERSION.html"
+  echo "  ✓ release notes attached"
+else
+  echo "  ! no RELEASE-NOTES-$VERSION.html — the update will show no description"
+fi
+
 DL_BASE="https://github.com/TylerSimmons212/videopro/releases/download/v$VERSION"
 "$GENERATE_APPCAST" --download-url-prefix "$DL_BASE/" \
                     --link "https://github.com/TylerSimmons212/videopro" \
