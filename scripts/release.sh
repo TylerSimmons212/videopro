@@ -180,6 +180,10 @@ cp "$DMG" "$FEEDDIR/VideoPro-$VERSION.dmg"
 NOTES="$ROOT/RELEASE-NOTES-$VERSION.html"
 if [ -f "$NOTES" ]; then
   cp "$NOTES" "$FEEDDIR/VideoPro-$VERSION.html"
+  # generate_appcast derives releaseNotesLink from the ARCHIVE basename and points
+  # it at the repo root, so the file has to exist there under that name too — not
+  # just in the feed dir. Getting this wrong publishes an appcast whose notes 404.
+  cp "$NOTES" "$ROOT/VideoPro-$VERSION.html"
   echo "  ✓ release notes attached"
 else
   echo "  ! no RELEASE-NOTES-$VERSION.html — the update will show no description"
