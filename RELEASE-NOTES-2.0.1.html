@@ -1,0 +1,21 @@
+<html><head><meta charset="utf-8"><style>
+body{font:13px -apple-system,system-ui;margin:14px;line-height:1.5}
+h1{font-size:16px;margin:0 0 4px}h2{font-size:13px;margin:16px 0 4px}
+ul{margin:4px 0;padding-left:20px}li{margin:3px 0}
+</style></head><body>
+<h1>VideoPro 2.0.1</h1>
+<h2>Fixes the browser grab when VideoPro is run from the disk image</h2>
+<p>If you opened VideoPro straight from the downloaded disk image, macOS was running</p>
+<p>it from a temporary copy. That stopped it from asking permission to read your</p>
+<p>browser&#x27;s current tab — and because macOS only lists apps that have already</p>
+<p>asked, VideoPro never appeared under Privacy &amp; Security → Automation, so there</p>
+<p>was no switch to turn on.</p>
+<ul>
+<li>VideoPro now notices this at launch and offers to move itself to Applications,</li>
+</ul>
+<p>  which is what makes the permission prompt work.</p>
+<ul>
+<li>If permission was already refused, the message now offers to ask again rather</li>
+</ul>
+<p>  than pointing at a setting that may not exist yet.</p>
+<p>Nothing else has changed from 2.0.0.</p></body></html>
