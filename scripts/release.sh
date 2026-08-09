@@ -91,7 +91,19 @@ for f in "$APP/Contents/Frameworks/"*; do
   [ -e "$f" ] && sign "$f"
 done
 for p in "$APP/Contents/PlugIns/"*; do [ -e "$p" ] && sign "$p"; done
-sign "$APP"
+
+# The app itself must be re-signed WITH its entitlements. A plain `codesign -s`
+# drops them, and losing com.apple.security.automation.apple-events under
+# Hardened Runtime silently kills the front-tab grab: the Apple event is refused
+# before macOS ever prompts, so no Automation entry is created and the user is
+# left with a permission they cannot grant. That is how 2.0.0/2.0.1 shipped.
+APP_ENTS="$ROOT/VideoProApp/VideoProApp/VideoProApp.entitlements"
+if [ -f "$APP_ENTS" ]; then
+  codesign --force --options runtime --timestamp \
+    --entitlements "$APP_ENTS" -s "$DEVID" "$APP"
+else
+  echo "✗ missing $APP_ENTS — the browser grab would ship broken"; exit 1
+fi
 
 # Fail loudly here rather than 20 minutes later at Apple: every executable must
 # carry a Developer ID, not adhoc.
@@ -106,6 +118,18 @@ done < <(find "$APP" \( -name "*.xpc" -o -name "*.app" -o -name "*.framework" -o
          find "$APP/Contents/Frameworks" -maxdepth 3 -type f -perm +111 -print 2>/dev/null)
 [ "$ADHOC" -eq 0 ] || { echo "✗ ad-hoc code would fail notarization — aborting"; exit 1; }
 codesign --verify --strict --deep "$APP" && echo "  ✓ signed, no ad-hoc code"
+
+# Entitlements survive? `codesign --verify` passes happily on an app that lost
+# them, and the symptom is invisible until a user tries the front-tab grab on a
+# hardened build and gets a permission they can't grant.
+echo "→ verifying the Apple-events entitlement survived signing…"
+if codesign -d --entitlements - "$APP" 2>/dev/null | grep -q "com.apple.security.automation.apple-events"; then
+  echo "  ✓ apple-events entitlement present"
+else
+  echo "✗ apple-events entitlement missing after signing — the browser grab would"
+  echo "  be dead on arrival (Hardened Runtime refuses the event, macOS never prompts)"
+  exit 1
+fi
 
 # RUNTIME smoke test — the check that would have caught 1.0.8 shipping broken.
 # `codesign --verify` and notarization both PASS on a yt-dlp that can't actually

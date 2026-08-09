@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- Required to read the browser's front tab.
+
+	     Release builds are signed with Hardened Runtime, which blocks Apple
+	     events outright unless this entitlement is present — the send fails with
+	     errAEEventNotPermitted (-1743) and macOS never prompts, so no entry is
+	     ever created under Privacy & Security → Automation and there is nothing
+	     for the user to switch on.
+
+	     This is invisible in debug builds, which aren't hardened and so send
+	     Apple events happily without it. 2.0.0 and 2.0.1 shipped broken for
+	     exactly that reason. -->
+	<key>com.apple.security.automation.apple-events</key>
+	<true/>
+</dict>
+</plist>
