@@ -3,6 +3,17 @@
     <channel>
         <title>VideoPro</title>
         <item>
+            <title>2.0.2</title>
+            <pubDate>Sat, 08 Aug 2026 23:56:32 -0700</pubDate>
+            <link>https://github.com/TylerSimmons212/videopro</link>
+            <sparkle:version>20002</sparkle:version>
+            <sparkle:shortVersionString>2.0.2</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>26.0</sparkle:minimumSystemVersion>
+            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
+            <sparkle:releaseNotesLink>https://raw.githubusercontent.com/TylerSimmons212/videopro/main/VideoPro-2.0.2.html</sparkle:releaseNotesLink>
+            <enclosure url="https://github.com/TylerSimmons212/videopro/releases/download/v2.0.2/VideoPro-2.0.2.dmg" length="103016871" type="application/octet-stream" sparkle:edSignature="V+r/2zgaoExbYVLphBAwHOSFxOVAzI1oA0behqyt0lqUZHOq6iCqYHjr6i6i+9sgv8tGTlvK4bc716HxQ28SCg=="/>
+        </item>
+        <item>
             <title>2.0.1</title>
             <pubDate>Sat, 08 Aug 2026 23:37:15 -0700</pubDate>
             <link>https://github.com/TylerSimmons212/videopro</link>
@@ -23,16 +34,6 @@
             <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
             <sparkle:releaseNotesLink>https://raw.githubusercontent.com/TylerSimmons212/videopro/main/VideoPro-2.0.0.html</sparkle:releaseNotesLink>
             <enclosure url="https://github.com/TylerSimmons212/videopro/releases/download/v2.0.0/VideoPro-2.0.0.dmg" length="100985983" type="application/octet-stream" sparkle:edSignature="aZaLr5k1k1gCs5hrSmffk7mloI/0IqnovPGTR3GBqLD4BRd5A9x/NpNgSp0pBlwypekglBDPT4vaDCgJcnf6Cw=="/>
-        </item>
-        <item>
-            <title>1.0.9</title>
-            <pubDate>Fri, 17 Jul 2026 17:42:19 -0700</pubDate>
-            <link>https://github.com/TylerSimmons212/videopro</link>
-            <sparkle:version>10009</sparkle:version>
-            <sparkle:shortVersionString>1.0.9</sparkle:shortVersionString>
-            <sparkle:minimumSystemVersion>26.0</sparkle:minimumSystemVersion>
-            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
-            <enclosure url="https://github.com/TylerSimmons212/videopro/releases/download/v1.0.9/VideoPro-1.0.9.dmg" length="102481079" type="application/octet-stream" sparkle:edSignature="dmFEVXrCnP7UH5LR7xnU/RMwQyxJO12ct6+IFo3jw64jMoSIJGo5BGinLbgQBK8B4OsYWKkFiFbKCK5zpAbdBw=="/>
         </item>
     </channel>
 </rss>
