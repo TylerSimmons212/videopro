@@ -208,6 +208,10 @@ gh release create "v$VERSION" "$FEEDDIR/VideoPro-$VERSION.dmg" \
 
 # The feed is served from the repo, so it must be committed for anyone to see it.
 git add "$ROOT/appcast.xml"
+# The notes file has to be committed too, not just written — generate_appcast
+# points releaseNotesLink at the repo's raw URL, so an uncommitted file means a
+# published appcast whose notes 404. (Shipped that way in 2.0.0 and 2.0.1.)
+[ -f "$ROOT/VideoPro-$VERSION.html" ] && git add "$ROOT/VideoPro-$VERSION.html"
 git commit -m "Release $VERSION: update appcast" >/dev/null 2>&1 || true
 git push origin "$FEED_BRANCH"
 
