@@ -15,6 +15,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
     private static var pending: [URL] = []
 
+    /// Set alongside `onURL`. Runs as the app quits, to stop downloads where
+    /// they are and record them for the next launch.
+    static var onTerminate: (() -> Void)?
+
+    func applicationWillTerminate(_ notification: Notification) {
+        Self.onTerminate?()
+    }
+
     func applicationWillFinishLaunching(_ notification: Notification) {
         NSAppleEventManager.shared().setEventHandler(
             self,
@@ -59,6 +67,7 @@ struct VideoProApp: App {
         WindowGroup {
             ContentView()
                 .environmentObject(state)
+                .environmentObject(state.linkSearch)
                 .environmentObject(updater)
                 .frame(minWidth: 720, minHeight: 460)
                 .onAppear {
@@ -67,6 +76,9 @@ struct VideoProApp: App {
                     // any URL that arrived while we were still launching.
                     AppDelegate.onURL = { [weak state] url in
                         state?.handleURL(url)
+                    }
+                    AppDelegate.onTerminate = { [weak state] in
+                        state?.suspendDownloadsForQuit()
                     }
                 }
         }
@@ -77,8 +89,25 @@ struct VideoProApp: App {
                 CheckForUpdatesView(updater: updater)
             }
             CommandGroup(after: .newItem) {
+                Button("Download a Link…") {
+                    state.showMainWindow()
+                    state.linkSearch.focus()
+                }
+                .keyboardShortcut("l", modifiers: .command)
+                Button("Download Copied Link") { state.downloadCopiedLink() }
+                    .keyboardShortcut("v", modifiers: [.command, .shift])
                 Button("Grab Front Tab") { state.grabFrontTab() }
                     .keyboardShortcut("g", modifiers: [.command, .shift])
+            }
+            CommandGroup(after: .textEditing) {
+                Button("Search Library") {
+                    state.showMainWindow()
+                    state.linkSearch.focus()
+                }
+                .keyboardShortcut("f", modifiers: .command)
+            }
+            CommandMenu("Downloads") {
+                DownloadsMenu().environmentObject(state)
             }
         }
 
@@ -111,6 +140,24 @@ struct VideoProApp: App {
     }
 }
 
+/// The Downloads menu. A view of its own so it observes AppState and enables
+/// Pause All / Resume All only when there's something to pause or resume.
+struct DownloadsMenu: View {
+    @EnvironmentObject var state: AppState
+
+    var body: some View {
+        Button("Pause All") { state.pauseAll() }
+            .keyboardShortcut("p", modifiers: [.command, .option])
+            .disabled(!state.hasPausable)
+        Button("Resume All") { state.resumeAll() }
+            .keyboardShortcut("r", modifiers: [.command, .option])
+            .disabled(!state.hasPaused)
+        Divider()
+        Button("Show Downloads Folder") { NSWorkspace.shared.open(state.downloadFolder) }
+            .keyboardShortcut("o", modifiers: [.command, .shift])
+    }
+}
+
 /// Menu bar contents. Deliberately tiny — this surface exists to make a one-off
 /// grab take one click, not to be a second copy of the app.
 struct MenuBarContent: View {
@@ -135,6 +182,12 @@ struct MenuBarContent: View {
         if state.jobs.activeCount + state.jobs.queuedCount > 0 {
             Divider()
             Text("\(state.jobs.activeCount) running, \(state.jobs.queuedCount) queued")
+        }
+        if state.hasPausable {
+            Button("Pause All") { state.pauseAll() }
+        }
+        if state.hasPaused {
+            Button("Resume All") { state.resumeAll() }
         }
 
         Divider()

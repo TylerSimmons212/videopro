@@ -3,23 +3,14 @@ import Combine
 import SwiftUI
 import AppKit
 import UserNotifications
-import SafariServices
+import Security
 
 @MainActor
 final class AppState: ObservableObject {
     @Published var items: [VideoItem] = []
-    @Published var serverRunning = false
-    @Published var serverStatus = "Starting…"
     @Published var downloadFolder: URL
     @Published var toolsReady = false
     @Published var toolSummary = ""
-
-    /// Last time any browser extension talked to us — the popup pings /health on
-    /// every open, so this is how the setup UI can say "it's working" instead of
-    /// leaving the user to guess.
-    @Published var lastExtensionContact: Date?
-    /// Persisted so we can distinguish "never set up" from "set up, not open right now".
-    @Published var everConnected = false
 
     // User download preferences. All persisted — these used to reset to their
     // defaults on every launch, silently undoing whatever the user chose.
@@ -40,16 +31,6 @@ final class AppState: ObservableObject {
     /// System-wide hotkey for the fast path.
     @Published var hotKeyEnabled = true { didSet { persistPrefs(); applyHotKey() } }
 
-    /// Whether the loopback server for the browser extension is listening.
-    ///
-    /// Off unless the extension is actually being used. The server has no way to
-    /// tell a request from the extension apart from one forged by any page you
-    /// happen to be visiting — `focus.js` is a content script, so its requests
-    /// carry the *page's* origin, not the extension's. Now that the hotkey and
-    /// menu bar cover the common path without it, the honest default is not to
-    /// listen at all. Turning it on is a deliberate act, tied to extension setup.
-    @Published var serverEnabled = false { didSet { persistPrefs(); applyServerSetting() } }
-
     /// The combination the fast path listens for. User-changeable, because the
     /// default can collide with whatever else they've installed.
     @Published var hotKeyCombo: KeyCombo = .fallback { didSet { persistPrefs(); applyHotKey() } }
@@ -58,9 +39,19 @@ final class AppState: ObservableObject {
     /// it. Surfaced in Settings; without it a taken shortcut just looks broken.
     @Published var hotKeyUnavailable = false
 
+    /// Put a link copied in another app into the field when coming back.
+    @Published var offerCopiedLinks = true { didSet { persistPrefs() } }
+
+    /// Convert a finished download to HEVC when this Mac's QuickTime can't play
+    /// it — YouTube's 4K is AV1 or VP9, which Macs before M3 can't decode.
+    @Published var convertForQuickTime = true { didSet { persistPrefs() } }
+
     /// Mirrors JobCenter so views observing AppState still repaint when work
     /// starts or finishes. The queue itself lives in JobCenter now.
     let jobs = JobCenter.shared
+
+    /// The field at the top of the library: links to look up, or a search.
+    let linkSearch = LinkSearch()
 
     /// How many un-downloaded videos to pre-warm on launch. Each costs one
     /// `yt-dlp -J`, so this is a deliberate ceiling, not the whole library.
@@ -74,9 +65,6 @@ final class AppState: ObservableObject {
         )
     }
 
-    let port: UInt16 = 8787
-    private var server: LocalServer?
-
     init() {
         // Default download folder: ~/Downloads/VideoPro
         let downloads = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first
@@ -89,8 +77,7 @@ final class AppState: ObservableObject {
         if let saved = UserDefaults.standard.url(forKey: "downloadFolder") {
             self.downloadFolder = saved
         }
-        self.everConnected = UserDefaults.standard.bool(forKey: "everConnected")
-        loadPrefs()   // reads everConnected above for the serverEnabled default
+        loadPrefs()
 
         // Throttled so a burst of transitions coalesces into one re-render.
         VideoItem.statusChanged
@@ -105,12 +92,31 @@ final class AppState: ObservableObject {
             .sink { [weak self] in
                 let n = JobCenter.shared.activeCount
                 NSApp.dockTile.badgeLabel = n > 0 ? "\(n)" : ""
+                self?.updateKeepAwake()
                 self?.objectWillChange.send()
             }
             .store(in: &bag)
+
+        linkSearch.state = self
     }
 
     private var bag = Set<AnyCancellable>()
+
+    /// Held while anything is downloading or exporting, so the Mac doesn't go to
+    /// sleep on an unattended download. The display may still sleep.
+    private var keepAwake: NSObjectProtocol?
+
+    private func updateKeepAwake() {
+        let busy = JobCenter.shared.activeCount + JobCenter.shared.queuedCount > 0
+        if busy, keepAwake == nil {
+            keepAwake = ProcessInfo.processInfo.beginActivity(
+                options: [.idleSystemSleepDisabled, .automaticTerminationDisabled],
+                reason: "Downloading videos")
+        } else if !busy, let activity = keepAwake {
+            ProcessInfo.processInfo.endActivity(activity)
+            keepAwake = nil
+        }
+    }
 
     // MARK: - Preferences
 
@@ -120,9 +126,10 @@ final class AppState: ObservableObject {
         static let subs = "embedSubtitles"
         static let cookieBrowser = "cookieBrowserID"
         static let hotKey = "hotKeyEnabled"
-        static let server = "serverEnabled"
         static let hotKeyCode = "hotKeyCode"
         static let hotKeyModifiers = "hotKeyModifiers"
+        static let offerLinks = "offerCopiedLinks"
+        static let convertQT = "convertForQuickTime"
     }
 
     private var loadingPrefs = false
@@ -137,11 +144,8 @@ final class AppState: ObservableObject {
         if d.object(forKey: PrefKey.subs) != nil { embedSubtitles = d.bool(forKey: PrefKey.subs) }
         cookieBrowserID = d.string(forKey: PrefKey.cookieBrowser)
         if d.object(forKey: PrefKey.hotKey) != nil { hotKeyEnabled = d.bool(forKey: PrefKey.hotKey) }
-        // Migration: someone already using the extension must not silently lose it
-        // on update, so an existing connection counts as consent.
-        serverEnabled = d.object(forKey: PrefKey.server) != nil
-            ? d.bool(forKey: PrefKey.server)
-            : everConnected
+        // Left behind by the browser extension, which is gone.
+        for stale in ["serverEnabled", "everConnected"] { d.removeObject(forKey: stale) }
         if d.object(forKey: PrefKey.hotKeyCode) != nil,
            d.object(forKey: PrefKey.hotKeyModifiers) != nil {
             hotKeyCombo = KeyCombo(keyCode: UInt32(d.integer(forKey: PrefKey.hotKeyCode)),
@@ -149,6 +153,12 @@ final class AppState: ObservableObject {
         }
         if d.object(forKey: "inboxExpiryDays") != nil {
             inboxExpiryDays = d.integer(forKey: "inboxExpiryDays")
+        }
+        if d.object(forKey: PrefKey.offerLinks) != nil {
+            offerCopiedLinks = d.bool(forKey: PrefKey.offerLinks)
+        }
+        if d.object(forKey: PrefKey.convertQT) != nil {
+            convertForQuickTime = d.bool(forKey: PrefKey.convertQT)
         }
     }
 
@@ -160,9 +170,10 @@ final class AppState: ObservableObject {
         d.set(embedSubtitles, forKey: PrefKey.subs)
         d.set(cookieBrowserID, forKey: PrefKey.cookieBrowser)
         d.set(hotKeyEnabled, forKey: PrefKey.hotKey)
-        d.set(serverEnabled, forKey: PrefKey.server)
         d.set(Int(hotKeyCombo.keyCode), forKey: PrefKey.hotKeyCode)
         d.set(Int(hotKeyCombo.modifiers), forKey: PrefKey.hotKeyModifiers)
+        d.set(offerCopiedLinks, forKey: PrefKey.offerLinks)
+        d.set(convertForQuickTime, forKey: PrefKey.convertQT)
     }
 
     /// The browser cookies are currently being borrowed from, if any.
@@ -190,6 +201,10 @@ final class AppState: ObservableObject {
     // MARK: - Lifecycle
 
     func start() {
+        // Called from the main window's onAppear, which fires again when a closed
+        // window is reopened. Once is right: a second run would reload the
+        // library over live downloads and subscribe to everything twice.
+        guard !started else { return }
         clearOwnQuarantineIfNeeded()
         checkInstallLocation()
         loadCollections()
@@ -197,7 +212,6 @@ final class AppState: ObservableObject {
         expireInbox()
         refreshTools()
         requestNotifications()
-        applyServerSetting()
         applyCookieSetting()
         applyHotKey()
 
@@ -207,95 +221,99 @@ final class AppState: ObservableObject {
         let queued = pendingURLs
         pendingURLs.removeAll()
         for url in queued { handleURL(url) }
+
+        // Downloads that quitting cut off carry on by themselves; ones the user
+        // paused wait for them.
+        let interrupted = resumeOnLaunch
+        resumeOnLaunch = []
+        for item in interrupted { download(item) }
+
+        removeAbandonedConversions()
+
+        NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)
+            .sink { [weak self] _ in self?.offerCopiedLink() }
+            .store(in: &bag)
+        offerCopiedLink()
     }
 
-    // MARK: - Extension connection status
-
-    func noteExtensionContact() {
-        lastExtensionContact = Date()
-        if !everConnected {
-            everConnected = true
-            UserDefaults.standard.set(true, forKey: "everConnected")
-        }
-    }
-
-    /// Human-readable connection state for the setup UI.
-    var extensionStatus: (text: String, connected: Bool) {
-        if let seen = lastExtensionContact {
-            let secs = Int(Date().timeIntervalSince(seen))
-            if secs < 90 { return ("Extension connected", true) }
-            return ("Extension connected · last seen \(relative(secs)) ago", true)
-        }
-        if everConnected { return ("Set up — open the extension to reconnect", true) }
-        return ("No extension connected yet", false)
-    }
-
-    private func relative(_ secs: Int) -> String {
-        if secs < 60 { return "\(secs)s" }
-        if secs < 3600 { return "\(secs / 60)m" }
-        if secs < 86_400 { return "\(secs / 3600)h" }
-        return "\(secs / 86_400)d"
-    }
+    /// Filled by loadLibrary() with downloads that were running at quit.
+    private var resumeOnLaunch: [VideoItem] = []
 
     // MARK: - videopro:// URL scheme
 
     private var started = false
     private var pendingURLs: [URL] = []
 
-    /// Handle `videopro://add?v=<base64url JSON>`.
+    /// Handle `videopro://open?url=<page>` and `videopro://download?t=<token>&url=<page>`.
     ///
-    /// This is the Safari path. Safari won't let an extension reach 127.0.0.1, so
-    /// the POST that works in Chrome always fails there. LaunchServices *will*
-    /// route our registered URL scheme to us — and launch us if we're not running —
-    /// so the extension encodes the payload into the URL instead. Same JSON shape
-    /// as the HTTP bridge, so it reuses VideoMapper and the enrich pipeline.
+    /// What the bookmarklet sends: the page you're on, from any browser —
+    /// Firefox included, which the front-tab grab can't read.
+    ///
+    /// Any web page can fire a `videopro://` link, so nothing here may act on
+    /// its own say-so. `open` only puts the link in the field for the user to
+    /// look at. `download` starts it without asking only when it carries the
+    /// secret that's baked into the user's own bookmarklet; without it, it's
+    /// treated as `open`. And the address must be an ordinary web address —
+    /// no other schemes, and no way to smuggle a yt-dlp option in.
     func handleURL(_ url: URL) {
-        NSLog("VideoPro: handleURL fired: %@", url.absoluteString)
         guard url.scheme?.lowercased() == "videopro" else { return }
         // A cold launch delivers the URL before start() — hold it until we're ready.
         guard started else { pendingURLs.append(url); return }
 
-        // Accept videopro://add?… and videopro:///add?… alike.
+        // Accept videopro://open?… and videopro:///open?… alike.
         let action = (url.host?.isEmpty == false ? url.host! : url.path)
             .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
             .lowercased()
-        guard action == "add" else { return }   // bare videopro:// = just focus us
-
-        guard let comps = URLComponents(url: url, resolvingAgainstBaseURL: false),
-              let encoded = comps.queryItems?.first(where: { $0.name == "v" })?.value,
-              let data = Self.decodeBase64URL(encoded),
-              let batch = try? JSONDecoder().decode(IncomingBatch.self, from: data) else {
+        let query = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems ?? []
+        guard let page = query.first(where: { $0.name == "url" })?.value,
+              let link = LinkSearch.link(from: page),
+              let scheme = URL(string: link)?.scheme?.lowercased(),
+              scheme == "http" || scheme == "https"
+        else {
+            showMainWindow()   // bare videopro:// — just come forward
             return
         }
-        let metas = VideoMapper.metas(from: batch)
-        guard !metas.isEmpty else { return }
-        // Safari can't reach the local server, so this scheme delivery is the only
-        // "the extension is working" signal we'll ever get from it.
-        noteExtensionContact()
-        add(metas)
+        let trusted = query.first(where: { $0.name == "t" })?.value == bookmarkletToken
+        showMainWindow()
+        if action == "download" && trusted {
+            linkSearch.openAndDownload(link)
+        } else if action == "download" || action == "open" {
+            linkSearch.query = link
+            linkSearch.focus()
+        }
     }
 
-    /// base64url → Data (the extension strips `=` padding and swaps `+/` for `-_`
-    /// so the payload survives being a URL query value).
-    private static func decodeBase64URL(_ s: String) -> Data? {
-        var t = s.replacingOccurrences(of: "-", with: "+")
-                 .replacingOccurrences(of: "_", with: "/")
-        while t.count % 4 != 0 { t += "=" }
-        return Data(base64Encoded: t)
+    /// A per-install secret that only the user's own bookmarklet knows. Made on
+    /// first use; it isn't protecting anything on this Mac, only telling the
+    /// bookmarklet apart from a web page that fires the same kind of link.
+    var bookmarkletToken: String {
+        let key = "bookmarkletToken"
+        if let t = UserDefaults.standard.string(forKey: key), t.count >= 32 { return t }
+        var bytes = [UInt8](repeating: 0, count: 24)
+        _ = SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes)
+        let t = bytes.map { String(format: "%02x", $0) }.joined()
+        UserDefaults.standard.set(t, forKey: key)
+        return t
+    }
+
+    /// The bookmarklet for the browser's bookmarks bar. It hands the page's
+    /// address to the app and nothing else — no access to other pages, no
+    /// extension to install or keep updated.
+    var bookmarklet: String {
+        "javascript:location.href='videopro://download?t=\(bookmarkletToken)&url='+encodeURIComponent(location.href)"
     }
 
     // MARK: - Install location & installer cleanup
 
     /// Strip our own `com.apple.quarantine` on launch.
     ///
-    /// Anything downloaded through a browser gets quarantined. On macOS 27 that
-    /// blocks our bundled Safari Web Extension from registering — the containing
-    /// app is flagged, so `showPreferencesForExtension` returns SFErrorDomain
-    /// error 1 ("no extension found"). The user can't fix it from Terminal
-    /// without granting Full Disk Access (a `com.apple.macl` lock blocks `xattr`
-    /// otherwise), but WE can: a running, non-sandboxed app is allowed to modify
-    /// its own bundle. So clear it here, once, and note if a relaunch is warranted
-    /// so the extension gets re-scanned un-quarantined.
+    /// Added for the Safari extension, which wouldn't register from a
+    /// quarantined app. The extension is gone, but this stays for now: a
+    /// quarantined bundle is also what App Translocation keys on, and the
+    /// translocation fix in 2.0.1 was verified with this running. Drop it once a
+    /// release confirms the Automation prompt works without it. (A running,
+    /// non-sandboxed app may modify its own bundle; the user can't easily, since
+    /// `com.apple.macl` blocks `xattr` without Full Disk Access.)
     private func clearOwnQuarantineIfNeeded() {
         let bundlePath = Bundle.main.bundlePath
         // Dev builds in DerivedData are never quarantined; skip the work.
@@ -315,16 +333,13 @@ final class AppState: ObservableObject {
         do {
             try p.run(); p.waitUntilExit()
             if p.terminationStatus == 0 {
-                NSLog("VideoPro: cleared own quarantine — Safari extension can now register")
+                NSLog("VideoPro: cleared own quarantine")
             }
         } catch {
             NSLog("VideoPro: quarantine clear failed: %@", error.localizedDescription)
         }
     }
 
-    /// If we're running from a DMG or Downloads, offer to move to /Applications
-    /// (also required for Safari to load the extension). If already installed,
-    /// offer to eject leftover installer disk images.
     /// Is macOS running us from a randomised read-only copy?
     ///
     /// Opening a quarantined app straight from a DMG triggers App Translocation:
@@ -338,6 +353,8 @@ final class AppState: ObservableObject {
         Bundle.main.bundlePath.contains("/AppTranslocation/")
     }
 
+    /// If we're running from a DMG or Downloads, offer to move to /Applications.
+    /// If already installed, offer to eject leftover installer disk images.
     func checkInstallLocation() {
         let path = Bundle.main.bundlePath
         if path.hasPrefix("/Applications/") {
@@ -355,7 +372,7 @@ final class AppState: ObservableObject {
             : "Move VideoPro to Applications?"
         a.informativeText = isTranslocated
             ? "macOS is running VideoPro from a temporary copy, which stops it asking for permission to read your browser’s tab — the Automation list stays empty and there’s nothing to switch on. Moving it to Applications fixes that."
-            : "VideoPro should live in your Applications folder. Safari also needs it there to load the extension."
+            : "VideoPro should live in your Applications folder, so it keeps working after the disk image is ejected or Downloads is tidied up."
         a.addButton(withTitle: "Move to Applications")
         a.addButton(withTitle: "Not Now")
         guard a.runModal() == .alertFirstButtonReturn else { return }
@@ -405,45 +422,11 @@ final class AppState: ObservableObject {
         toolsReady = status.ready
         if let yt = status.ytDlp {
             let ff = status.ffmpeg != nil ? "ffmpeg ✓" : "ffmpeg ✗ (muxing limited)"
-            toolSummary = "yt-dlp: \((yt as NSString).lastPathComponent) · \(ff)"
+            let probe = status.ffprobe != nil ? "ffprobe ✓" : "ffprobe ✗ (no media details)"
+            let deno = status.deno != nil ? "deno ✓" : "deno ✗ (fewer YouTube formats)"
+            toolSummary = "yt-dlp: \((yt as NSString).lastPathComponent) · \(ff) · \(probe) · \(deno)"
         } else {
             toolSummary = "yt-dlp not found — install with `brew install yt-dlp`"
-        }
-    }
-
-    /// Bring the listener in line with the setting.
-    func applyServerSetting() {
-        if serverEnabled {
-            guard server == nil else { return }
-            startServer()
-        } else {
-            server?.stop()
-            server = nil
-            serverRunning = false
-            serverStatus = "Off — not needed unless you use the browser extension"
-        }
-    }
-
-    private func startServer() {
-        let server = LocalServer(port: port)
-        server.onStatus = { [weak self] running, message in
-            Task { @MainActor in
-                self?.serverRunning = running
-                self?.serverStatus = message
-            }
-        }
-        server.onBatch = { [weak self] metas in
-            Task { @MainActor in self?.add(metas) }
-        }
-        server.onContact = { [weak self] in
-            Task { @MainActor in self?.noteExtensionContact() }
-        }
-        do {
-            try server.start()
-            self.server = server
-        } catch {
-            serverRunning = false
-            serverStatus = "Could not open port \(port): \(error.localizedDescription)"
         }
     }
 
@@ -546,6 +529,116 @@ final class AppState: ObservableObject {
         content.body = body
         let req = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
         UNUserNotificationCenter.current().add(req)
+    }
+
+    // MARK: - From the link field
+
+    /// Take one video from the link field into the library, downloading it or
+    /// just keeping it there.
+    func takeLinkVideo(_ video: LinkVideo, site: String?, quality: DownloadQuality, download: Bool) {
+        let item = libraryItem(for: video.entry, site: site)
+        // The lookup already did what enrichment does; don't pay for it twice.
+        if !video.choices.isEmpty {
+            item.availableHeights = video.heights
+            if !video.chapters.isEmpty { item.meta.chapters = video.chapters }
+            if let p = video.playURL, let u = URL(string: p) {
+                item.setPlayURL(u, expires: DownloadManager.expiry(for: p))
+            }
+            item.enriched = true
+        } else {
+            enrich(item)
+        }
+        saveLibrary()
+        if download, item.status != .done { self.download(item, quality: quality) }
+    }
+
+    /// Take the videos picked in the link field's grid and download them all.
+    func takeLinkEntries(_ entries: [LinkEntry], site: String?, quality: DownloadQuality) {
+        // Added last-to-first so the list reads in the page's order with the
+        // first on top, then queued first-to-last so it downloads in that order.
+        let added = entries.reversed().map { libraryItem(for: $0, site: site) }.reversed()
+        for item in added where item.status != .done {
+            download(item, quality: quality)
+        }
+        saveLibrary()
+    }
+
+    /// The library's state for a link, if it's there — the grid marks videos
+    /// already downloaded so they aren't fetched twice by accident.
+    func libraryStatus(for url: String) -> DownloadStatus? {
+        items.first { $0.meta.downloadURL == url || $0.meta.pageURL == url }?.status
+    }
+
+    /// The existing item for a link, or a new one filled in from what the
+    /// lookup already knows. Not enriched: the entry carries its title,
+    /// thumbnail and length, and a grid of sixty shouldn't start sixty probes.
+    private func libraryItem(for entry: LinkEntry, site: String?) -> VideoItem {
+        if let existing = items.first(where: { $0.meta.downloadURL == entry.url || $0.meta.pageURL == entry.url }) {
+            return existing
+        }
+        let meta = VideoMeta(title: entry.title, pageURL: entry.url, mediaURL: "", sourceKind: "page",
+                             thumbnail: entry.thumbnail ?? "", duration: entry.duration,
+                             width: 0, height: 0, platform: site == "Web" ? nil : site)
+        let item = VideoItem(meta)
+        items.insert(item, at: 0)
+        if entry.thumbnail == nil { enrich(item) }
+        return item
+    }
+
+    /// Download whatever link is on the clipboard (⇧⌘V). Goes through the
+    /// field so a playlist is shown for picking rather than fetched whole.
+    func downloadCopiedLink() {
+        let pb = NSPasteboard.general
+        guard let text = pb.string(forType: .string), let link = LinkSearch.link(from: text) else {
+            NSSound.beep()
+            return
+        }
+        lastPasteboardChange = pb.changeCount
+        lastOfferedLink = link
+        showMainWindow()
+        linkSearch.openAndDownload(link)
+    }
+
+    func showMainWindow() {
+        NSApp.activate(ignoringOtherApps: true)
+        NSApp.windows.first { $0.canBecomeMain }?.makeKeyAndOrderFront(nil)
+    }
+
+    // MARK: - Copied links
+
+    /// The pasteboard's change count when we last looked, so coming back with
+    /// the same clipboard doesn't offer the same link again. Starts unset, so a
+    /// link copied before launch is offered once.
+    private var lastPasteboardChange = -1
+    private var lastOfferedLink: String?
+
+    /// Offer a link the user copied elsewhere, the moment they come back.
+    ///
+    /// Asks the pasteboard whether it holds a web address *before* reading it.
+    /// That check doesn't count as access, so the system's paste-privacy prompt
+    /// can only ever appear when there's a link worth offering — never for
+    /// whatever text someone happened to copy.
+    func offerCopiedLink() {
+        guard offerCopiedLinks, linkSearch.query.isEmpty else { return }
+        let pb = NSPasteboard.general
+        guard pb.changeCount != lastPasteboardChange else { return }
+        lastPasteboardChange = pb.changeCount
+        guard pb.accessBehavior != .alwaysDeny else { return }
+
+        let webURL: PartialKeyPath<NSPasteboard.DetectedValues> = \NSPasteboard.DetectedValues.probableWebURL
+        Task {
+            guard let found = try? await pb.detectedPatterns(for: [webURL]), found.contains(webURL),
+                  let values = try? await pb.detectedValues(for: [webURL]),
+                  let link = LinkSearch.link(from: values.probableWebURL),
+                  link != lastOfferedLink,
+                  // Already in the library means already dealt with — including a
+                  // link just copied out of it with Copy Source URL.
+                  libraryStatus(for: link) == nil,
+                  linkSearch.query.isEmpty
+            else { return }
+            lastOfferedLink = link
+            linkSearch.offer(link)
+        }
     }
 
     /// Add a video by pasting a URL directly into the app (no extension needed).
@@ -652,7 +745,20 @@ final class AppState: ObservableObject {
         }
     }
 
+    /// Removing an unfinished download stops it and deletes its partial files —
+    /// they'd otherwise sit in Downloads with nothing left that knows about them.
+    private func abandonDownload(_ item: VideoItem) {
+        if let job = JobCenter.shared.active.first(where: { $0.itemID == item.id }) {
+            JobCenter.shared.cancel(job)
+        }
+        if let pending = item.meta.pending {
+            DownloadManager.removePartials(pending.partials)
+            item.meta.pending = nil
+        }
+    }
+
     func remove(_ item: VideoItem) {
+        abandonDownload(item)
         items.removeAll { $0.id == item.id }
         for idx in collections.indices {
             collections[idx].ordering.removeAll { $0 == item.id }
@@ -674,6 +780,7 @@ final class AppState: ObservableObject {
     /// animate through.
     func remove(_ batch: [VideoItem]) {
         guard !batch.isEmpty else { return }
+        for item in batch { abandonDownload(item) }
         let ids = Set(batch.map(\.id))
         items.removeAll { ids.contains($0.id) }
         for idx in collections.indices {
@@ -717,7 +824,7 @@ final class AppState: ObservableObject {
         let cutoff = Date().addingTimeInterval(-Double(inboxExpiryDays) * 86_400)
         let stale = items.filter {
             $0.meta.tier == .inbox && !$0.meta.isLocal && $0.meta.receivedAt < cutoff
-                && $0.status != .downloading && $0.status != .queued
+                && !$0.status.isUnfinished && $0.meta.pending == nil
         }
         guard !stale.isEmpty else { return }
         let ids = Set(stale.map(\.id))
@@ -799,14 +906,31 @@ final class AppState: ObservableObject {
         // Nothing to fetch for a file that's already on disk.
         guard !item.meta.isLocal else { return }
         guard item.status != .downloading, item.status != .queued else { return }
-        let q = quality ?? defaultQuality
+        // A paused or interrupted download resumes at the quality it started
+        // with. A different one picks different formats, so the partial data
+        // is useless and goes.
+        let resumable = item.meta.pending.flatMap { DownloadQuality(rawValue: $0.quality) }
+        let q = quality ?? resumable ?? defaultQuality
+        if let pending = item.meta.pending, pending.quality != q.rawValue {
+            DownloadManager.removePartials(pending.partials)
+            item.meta.pending = nil
+            item.progress = 0
+        }
+        item.meta.pending = PendingDownload(quality: q.rawValue, paused: false,
+                                            progress: item.meta.pending?.progress ?? 0,
+                                            partials: item.meta.pending?.partials ?? [])
+        saveLibrary()
         item.status = .queued
-        item.statusLine = "Queued…"
+        item.statusLine = item.progress > 0 ? "Queued · resumes at \(Int(item.progress * 100))%" : "Queued…"
 
         JobCenter.shared.enqueue(itemID: item.id, title: item.meta.title,
                                  kind: .download(q)) { [weak self] job in
             guard let self else { return false }
+            // Paused or cancelled between being scheduled and starting: the job
+            // is already settled, so starting yt-dlp now would orphan it.
+            guard !Task.isCancelled, job.state == .running else { return false }
             job.onCancel = { DownloadManager.shared.cancel(item) }
+            job.onPause = { DownloadManager.shared.pause(item) }
             try? FileManager.default.createDirectory(at: self.downloadFolder,
                                                      withIntermediateDirectories: true)
             var opts = self.options
@@ -822,22 +946,44 @@ final class AppState: ObservableObject {
             }
             progress.cancel()
             detail.cancel()
-            if ok { self.onDownloadFinished(item) }
+            if ok {
+                self.onDownloadFinished(item)
+            } else if item.status == .error {
+                // A failure that got partway keeps its record, so Retry — or the
+                // next launch, shown paused — continues it. One that never wrote
+                // anything (DRM, a dead link) has nothing to continue.
+                if item.meta.pending?.partials.isEmpty ?? true {
+                    item.meta.pending = nil
+                } else {
+                    item.meta.pending?.paused = true
+                    item.meta.pending?.progress = item.progress
+                }
+                self.saveLibrary()
+            }
             return ok
         }
     }
 
     /// Queue every item that isn't already downloaded or in flight.
     func downloadAll() {
-        for item in items where item.status == .idle || item.status == .error {
+        for item in items where item.status == .idle || item.status == .error || item.status == .paused {
             download(item)
         }
     }
 
+    /// Stop and throw away: the partial download goes too.
     func cancel(_ item: VideoItem) {
-        guard let job = JobCenter.shared.active.first(where: { $0.itemID == item.id }) else { return }
+        guard let job = JobCenter.shared.active.first(where: { $0.itemID == item.id }) else {
+            // Paused, or failed partway: no process, just files to clear up.
+            guard item.status == .paused || item.meta.pending != nil else { return }
+            discardPending(item)
+            if item.status == .paused { item.status = .idle }
+            item.statusLine = ""
+            return
+        }
         let wasQueued = job.state == .queued
         JobCenter.shared.cancel(job)
+        discardPending(item)
         // A queued job's work never ran, so nothing has touched the item — put it
         // back to idle rather than leaving it looking like a failure.
         if wasQueued {
@@ -846,13 +992,82 @@ final class AppState: ObservableObject {
         }
     }
 
+    /// Stop a download where it is. Its partial files stay, and Resume — or the
+    /// download menu at the same quality — carries on from there.
+    func pause(_ item: VideoItem) {
+        guard let job = JobCenter.shared.active.first(where: { $0.itemID == item.id }) else { return }
+        if item.meta.pending == nil, case .download(let q) = job.kind {
+            item.meta.pending = PendingDownload(quality: q.rawValue, paused: true)
+        }
+        JobCenter.shared.pause(job)
+        item.status = .paused
+        item.statusLine = "Paused"
+        item.meta.pending?.paused = true
+        item.meta.pending?.progress = item.progress
+        saveLibrary()
+    }
+
+    func resume(_ item: VideoItem) {
+        guard item.status == .paused || item.meta.pending != nil else { return }
+        download(item)
+    }
+
+    func pauseAll() {
+        // Queued ones first, so pausing a running one doesn't hand its slot to a
+        // queued download that's about to be paused anyway.
+        for item in items where item.status == .queued { pause(item) }
+        for item in items where item.status == .downloading { pause(item) }
+    }
+
+    func resumeAll() {
+        for item in items where item.status == .paused { resume(item) }
+    }
+
+    var hasPausable: Bool { items.contains { $0.status == .downloading || $0.status == .queued } }
+    var hasPaused: Bool { items.contains { $0.status == .paused } }
+
+    /// Forget a download's partial data, deleting its files.
+    private func discardPending(_ item: VideoItem) {
+        if let pending = item.meta.pending {
+            DownloadManager.removePartials(pending.partials)
+        }
+        item.meta.pending = nil
+        item.progress = 0
+        saveLibrary()
+    }
+
+    /// At quit: stop downloads where they are and note them, so the next launch
+    /// carries on. Without this yt-dlp kept running after VideoPro quit, and its
+    /// finished file never made it into the library.
+    func suspendDownloadsForQuit() {
+        for item in items where item.status == .downloading || item.status == .queued {
+            if item.meta.pending == nil,
+               let job = JobCenter.shared.active.first(where: { $0.itemID == item.id }),
+               case .download(let q) = job.kind {
+                item.meta.pending = PendingDownload(quality: q.rawValue, paused: false)
+            }
+            item.meta.pending?.paused = false
+            item.meta.pending?.progress = item.progress
+        }
+        DownloadManager.shared.stopAllForQuit()
+        // A conversion's ffmpeg would outlive us too. Cancelling stops it; the
+        // original file was never touched, and the half-written copy is swept
+        // up at the next launch.
+        for job in JobCenter.shared.active where job.kind == .convert {
+            JobCenter.shared.cancel(job)
+        }
+        saveLibrary()
+    }
+
     private func onDownloadFinished(_ item: VideoItem) {
         // Persist the result so it survives relaunch, and notify.
         if let idx = items.firstIndex(where: { $0.id == item.id }) {
             items[idx].meta.downloadedPath = item.outputPath
+            items[idx].meta.pending = nil
             saveLibrary()
         }
         notifyComplete(item)
+        convertIfUnplayable(item)
     }
 
     // MARK: - Notifications
@@ -1252,139 +1467,6 @@ final class AppState: ObservableObject {
         UNUserNotificationCenter.current().add(req)
     }
 
-    // MARK: - Browser extension
-
-    /// Where the unpacked extension lives.
-    ///
-    /// Deliberately NOT ~/Downloads: Chromium loads an unpacked extension *by
-    /// path* and keeps reading from it forever, so a folder in Downloads silently
-    /// breaks the extension the day the user tidies up. Application Support is
-    /// stable and out of the way.
-    var extensionFolder: URL {
-        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-            .appendingPathComponent("VideoPro", isDirectory: true)
-        return base.appendingPathComponent("extension", isDirectory: true)
-    }
-
-    /// Unpack the bundled extension to a stable folder. Returns the folder, or
-    /// nil (after alerting) if something went wrong.
-    @discardableResult
-    func unpackExtension() -> URL? {
-        guard let zip = Bundle.main.url(forResource: "extension", withExtension: "zip") else {
-            alert("Extension not bundled",
-                  "This build doesn’t include the browser extension yet. Run scripts/bundle-extension.sh and rebuild.")
-            return nil
-        }
-        let dest = extensionFolder
-        try? FileManager.default.removeItem(at: dest)
-        try? FileManager.default.createDirectory(at: dest, withIntermediateDirectories: true)
-
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: "/usr/bin/ditto")
-        p.arguments = ["-x", "-k", zip.path, dest.path]
-        do {
-            try p.run(); p.waitUntilExit()
-            guard p.terminationStatus == 0 else {
-                alert("Couldn’t unpack the extension", "ditto exited with code \(p.terminationStatus).")
-                return nil
-            }
-        } catch {
-            alert("Couldn’t unpack the extension", error.localizedDescription)
-            return nil
-        }
-        return dest
-    }
-
-    /// Set up the extension in a specific Chromium browser: unpack, copy the
-    /// folder path, reveal it in Finder, and deep-link the browser straight to
-    /// its extensions page.
-    func setUpExtension(in browser: BrowserTarget) {
-        // Setting the extension up is the consent: it cannot reach us otherwise.
-        serverEnabled = true
-        guard browser.kind == .chromium else {
-            openSafariExtensionSettings()
-            return
-        }
-        guard let folder = unpackExtension() else { return }
-
-        // "Load unpacked" opens a folder picker, so put the path on the clipboard
-        // (⌘⇧G pastes it) and reveal it in Finder for dragging.
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(folder.path, forType: .string)
-        NSWorkspace.shared.activateFileViewerSelecting([folder])
-
-        let config = NSWorkspace.OpenConfiguration()
-        config.activates = true
-        NSWorkspace.shared.open([URL(string: browser.extensionsPage)!],
-                                withApplicationAt: browser.appURL,
-                                configuration: config) { [weak self] _, error in
-            guard let error else { return }
-            Task { @MainActor in
-                self?.alert("Couldn’t open \(browser.name)",
-                            "Open \(browser.name) → Extensions and use “Load unpacked”.\n\n\(error.localizedDescription)")
-            }
-        }
-    }
-
-    /// Legacy entry point (onboarding/back-compat): set up the first Chromium
-    /// browser we find, or fall back to just revealing the folder.
-    func installExtension() {
-        if let first = BrowserScan.chromiumInstalled().first {
-            setUpExtension(in: first)
-        } else if let folder = unpackExtension() {
-            NSWorkspace.shared.activateFileViewerSelecting([folder])
-            alert("No Chromium browser found",
-                  "VideoPro couldn’t find Chrome, Arc, Brave, Edge, or Chromium.\n\nThe extension is unpacked at:\n\(folder.path)\n\nLoad it unpacked from your browser’s extensions page, or use Safari instead.")
-        }
-    }
-
-    /// Jump straight to Safari's Extensions settings so the user can enable the
-    /// bundled Safari Web Extension.
-    ///
-    /// `showPreferencesForExtension` fails with SFErrorDomain error 1 whenever
-    /// Safari hasn't registered our appex — which, on the current macOS beta,
-    /// PluginKit accepts (`pluginkit -a` exits 0) but silently doesn't honor.
-    /// So on failure we don't dead-end: we open Safari ourselves and offer the
-    /// path that does work here — loading the unpacked folder via Develop → Add
-    /// Temporary Extension.
-    func openSafariExtensionSettings() {
-        // Safari reaches us over the videopro:// scheme rather than the port, but
-        // enable it anyway so the two browsers behave the same.
-        serverEnabled = true
-        SFSafariApplication.showPreferencesForExtension(withIdentifier: "com.videopro.app.safari") { [weak self] error in
-            guard error != nil else { return }
-            Task { @MainActor in self?.safariFallback() }
-        }
-    }
-
-    private func safariFallback() {
-        // Make sure the unpacked folder exists — the temporary-extension path
-        // needs it — and open Safari so the user is one menu away.
-        let folder = unpackExtension() ?? extensionFolder
-        NSWorkspace.shared.open(URL(fileURLWithPath: "/Applications/Safari.app"))
-
-        let a = NSAlert()
-        a.messageText = "Enable VideoPro in Safari"
-        a.informativeText = """
-        Safari couldn’t open its extension settings automatically (its extension \
-        registration is unreliable on this macOS build).
-
-        Reliable way to load it right now:
-        1.  Safari → Settings → Advanced → tick “Show features for web developers”
-        2.  Develop menu → “Add Temporary Extension…”
-        3.  Choose the folder VideoPro reveals for you
-
-        (Temporary extensions are removed when you quit Safari. A full restart of \
-        your Mac often makes the permanent one appear, since it clears Safari’s \
-        extension cache.)
-        """
-        a.addButton(withTitle: "Reveal Extension Folder")
-        a.addButton(withTitle: "Done")
-        if a.runModal() == .alertFirstButtonReturn {
-            NSWorkspace.shared.activateFileViewerSelecting([folder])
-        }
-    }
-
     private func alert(_ title: String, _ body: String) {
         let a = NSAlert()
         a.messageText = title
@@ -1440,6 +1522,17 @@ final class AppState: ObservableObject {
             if let path = item.meta.downloadedPath, !path.isEmpty,
                FileManager.default.fileExists(atPath: path) {
                 item.markDone(path: path)
+                item.meta.pending = nil
+            } else if let pending = item.meta.pending {
+                // Unfinished last time: paused ones wait, interrupted ones carry
+                // on once start() has the tools ready.
+                item.progress = pending.progress
+                if pending.paused {
+                    item.status = .paused
+                    item.statusLine = "Paused"
+                } else {
+                    resumeOnLaunch.append(item)
+                }
             }
         }
 

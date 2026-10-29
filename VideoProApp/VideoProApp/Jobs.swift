@@ -9,6 +9,9 @@ enum JobKind: Equatable, Sendable {
     /// Joining a collection into one file. Shares the export lane: it is the same
     /// CPU-bound ffmpeg work, just N+1 processes instead of one or two.
     case buildCollection(String)
+    /// Re-encoding a download to HEVC because this Mac's QuickTime can't play
+    /// it. CPU/encoder work, so it shares the export lane too.
+    case convert
 
     /// What the user is told this job is. Kept here so a row, a notification and
     /// a log line can never describe the same job differently.
@@ -17,6 +20,7 @@ enum JobKind: Equatable, Sendable {
         case .download(let q): return "Download · \(q.rawValue)"
         case .export(let t):   return "Export · \(t.displayName)"
         case .buildCollection(let name): return "Build · \(name)"
+        case .convert:         return "Convert · HEVC for QuickTime"
         }
     }
 
@@ -25,6 +29,7 @@ enum JobKind: Equatable, Sendable {
         case .download: return "arrow.down.circle"
         case .export:   return "square.and.arrow.up.on.square"
         case .buildCollection: return "film.stack"
+        case .convert:  return "arrow.triangle.2.circlepath"
         }
     }
 }
@@ -35,6 +40,10 @@ enum JobState: Equatable, Sendable {
     case succeeded
     case failed(String)
     case cancelled
+    /// Stopped by the user with its partial data kept. Terminal for the *job* —
+    /// it gives its slot back — and resuming starts a fresh job that picks the
+    /// data up, the same way a retry does.
+    case paused
 }
 
 /// One unit of user-visible work.
@@ -63,6 +72,9 @@ final class Job: ObservableObject, Identifiable {
     /// process). Cancelling a job that never set this still settles the job —
     /// the work simply finds itself orphaned and its result ignored.
     var onCancel: (() -> Void)?
+    /// Like `onCancel`, but the work stops keeping what it has. Unset for work
+    /// that can't be resumed, which is then simply stopped.
+    var onPause: (() -> Void)?
 
     init(itemID: UUID, title: String, kind: JobKind) {
         self.id = UUID()
@@ -172,6 +184,14 @@ final class JobCenter: ObservableObject {
         for job in jobs where job.isActive { cancel(job) }
     }
 
+    /// Stop a job and free its slot, keeping whatever it has done so far.
+    func pause(_ job: Job) {
+        guard job.isActive else { return }
+        if let onPause = job.onPause { onPause() } else { job.onCancel?() }
+        stopTask(for: job.id)
+        finish(job, .paused)
+    }
+
     /// Re-runs the original work on a *fresh* job, leaving the failed one in
     /// history.
     ///
@@ -197,6 +217,7 @@ final class JobCenter: ObservableObject {
         case .download: return .download
         case .export:   return .export
         case .buildCollection: return .export
+        case .convert: return .export
         }
     }
 
@@ -240,6 +261,7 @@ final class JobCenter: ObservableObject {
     private func finish(_ job: Job, _ state: JobState) {
         job.markFinished(state)
         job.onCancel = nil
+        job.onPause = nil
         objectWillChange.send()
         trimHistory()
         pump(lane(of: job.kind))

@@ -68,9 +68,19 @@ sign () { codesign --force --options runtime --timestamp -s "$DEVID" "$@"; }
 # every download. (This shipped broken in 1.0.8; local ad-hoc builds don't hit it
 # because they aren't hardened.) See scripts/tool-entitlements.plist.
 TOOL_ENTS="$ROOT/scripts/tool-entitlements.plist"
-find "$APP/Contents/Resources/bin" -type f -perm +111 -exec \
+find "$APP/Contents/Resources/bin" -type f -perm +111 ! -name deno -exec \
   codesign --force --options runtime --timestamp \
     --entitlements "$TOOL_ENTS" -s "$DEVID" {} \;
+
+# Deno is signed separately: V8 compiles JavaScript at runtime, so it needs
+# allow-jit and friends (the same set Deno Land signs it with). Signed with
+# tool-entitlements.plist like the others, it would crash under Hardened Runtime
+# and yt-dlp would silently fall back to running without a JS runtime.
+DENO_ENTS="$ROOT/scripts/deno-entitlements.plist"
+if [ -f "$APP/Contents/Resources/bin/deno" ]; then
+  codesign --force --options runtime --timestamp \
+    --entitlements "$DENO_ENTS" -s "$DEVID" "$APP/Contents/Resources/bin/deno"
+fi
 
 # Sparkle must be signed INSIDE-OUT. `codesign` on a framework does NOT recurse
 # into nested bundles, so signing only the framework left Autoupdate, Updater.app
@@ -147,7 +157,21 @@ for t in ffmpeg ffprobe; do
   "$APP/Contents/Resources/bin/$t" -version >/dev/null 2>&1 \
     || { echo "✗ bundled $t fails to run after signing"; exit 1; }
 done
-echo "  ✓ yt-dlp $("$YTDLP" --version 2>/dev/null) + ffmpeg/ffprobe run"
+# Deno has to run JavaScript under Hardened Runtime (the JIT is what a wrong
+# entitlement breaks), and yt-dlp has to find it — either failing leaves YouTube
+# on yt-dlp's deprecated no-runtime path with fewer formats.
+DENO="$APP/Contents/Resources/bin/deno"
+if ! [ "$("$DENO" eval 'console.log(6 * 7)' 2>/dev/null)" = "42" ]; then
+  echo "✗ bundled deno can't run JavaScript after signing (check scripts/deno-entitlements.plist)"
+  exit 1
+fi
+# Captured first: with no URL yt-dlp exits 2, which pipefail would read as failure.
+YT_DEBUG="$("$YTDLP" -v --js-runtimes "deno:$DENO" 2>&1 || true)"
+if ! printf '%s\n' "$YT_DEBUG" | grep -q "JS runtimes: deno"; then
+  echo "✗ bundled yt-dlp doesn't detect the bundled deno"
+  exit 1
+fi
+echo "  ✓ yt-dlp $("$YTDLP" --version 2>/dev/null) + ffmpeg/ffprobe run; yt-dlp uses deno $("$DENO" --version 2>/dev/null | head -1 | cut -d' ' -f2)"
 
 # Rebuild the DMG from the now-properly-signed app.
 echo "→ rebuilding DMG from the signed app…"

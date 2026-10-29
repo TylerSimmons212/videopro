@@ -45,13 +45,9 @@ echo "→ signing bundled binaries (Developer ID + hardened runtime)…"
 codesign --force --timestamp --options runtime --entitlements "$ENT" -s "$DEV_ID" "$APP/Contents/Resources/bin/yt-dlp"
 codesign --force --timestamp --options runtime                        -s "$DEV_ID" "$APP/Contents/Resources/bin/ffmpeg"
 codesign --force --timestamp --options runtime                        -s "$DEV_ID" "$APP/Contents/Resources/bin/ffprobe"
-
-# Sign the embedded Safari extension (nested code must be signed before the app).
-APPEX="$APP/Contents/PlugIns/safari.appex"
-if [ -d "$APPEX" ]; then
-  echo "→ signing the Safari extension…"
-  codesign --force --timestamp --options runtime --preserve-metadata=entitlements -s "$DEV_ID" "$APPEX"
-fi
+# Deno needs the JIT entitlements it ships with; see scripts/deno-entitlements.plist.
+codesign --force --timestamp --options runtime --entitlements "$ROOT/scripts/deno-entitlements.plist" \
+  -s "$DEV_ID" "$APP/Contents/Resources/bin/deno"
 
 echo "→ signing the app…"
 codesign --force --timestamp --options runtime -s "$DEV_ID" "$APP"

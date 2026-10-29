@@ -1,0 +1,34 @@
+# Pinned tool downloads for the bundled yt-dlp, ffmpeg, ffprobe and Deno.
+#
+# Every build fetches exactly these files and refuses any whose SHA-256 doesn't
+# match, so a compromised mirror or a silently replaced "latest" can't end up in
+# a release. Each hash here was checked against the publisher's own checksum
+# file when it was pinned (yt-dlp's SHA2-256SUMS, Deno's .sha256sum, Martin
+# Riedl's .sha256).
+#
+# Don't edit by hand. Bump everything to the latest releases with:
+#     bash scripts/pin-binaries.sh
+# yt-dlp needs bumping for every release: YouTube starts refusing versions a few
+# months old (HTTP 403), and package-app.sh warns once the pin is 60 days old.
+#
+# Sourced by scripts/tools.sh. Plain shell assignments only.
+
+YTDLP_VERSION="2026.10.26"
+YTDLP_URL="https://github.com/yt-dlp/yt-dlp/releases/download/2026.10.26/yt-dlp_macos"
+YTDLP_SHA256="0f922c15ccc0b83eefa1c8bc9104e434318c4bf16e408e1ee93b7745a6efe0aa"
+
+FFMPEG_VERSION="9.0.2"
+FFMPEG_arm64_URL="https://ffmpeg.martin-riedl.de/download/macos/arm64/1789931890_9.0.2/ffmpeg.zip"
+FFMPEG_arm64_SHA256="c8ed4c4e6978a03c485edbfe4e0a5dc2380f8a30bba5150531b31b094492d924"
+FFPROBE_arm64_URL="https://ffmpeg.martin-riedl.de/download/macos/arm64/1789931890_9.0.2/ffprobe.zip"
+FFPROBE_arm64_SHA256="fcbe839537485eaee7a7a8bc5cbc0f90d53617e80943e8a5b2e31cb851197ea6"
+FFMPEG_amd64_URL="https://ffmpeg.martin-riedl.de/download/macos/amd64/1789931006_9.0.2/ffmpeg.zip"
+FFMPEG_amd64_SHA256="7c6b4125b191cbf773832dc51f424cf2b6bb7da43007d1e066f95909e47cacd4"
+FFPROBE_amd64_URL="https://ffmpeg.martin-riedl.de/download/macos/amd64/1789931006_9.0.2/ffprobe.zip"
+FFPROBE_amd64_SHA256="2322438ed2f6319a691291b247d09c69dcaa3a982460d1f269a7e1af335cfdfd"
+
+DENO_VERSION="2.9.8"
+DENO_arm64_URL="https://github.com/denoland/deno/releases/download/v2.9.8/deno-aarch64-apple-darwin.zip"
+DENO_arm64_SHA256="9f0bf660393da2eaff044cdc7444cb08c73f235849b61d224d825a194ce7c98e"
+DENO_amd64_URL="https://github.com/denoland/deno/releases/download/v2.9.8/deno-x86_64-apple-darwin.zip"
+DENO_amd64_SHA256="4b2f5edd2639b7470f034238b321d7002d8dfb4726d8558f52c17afac370eb2c"

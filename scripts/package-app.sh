@@ -2,7 +2,8 @@
 #
 # Build a self-contained, distributable VideoPro.app + DMG.
 #
-#   1. fetch standalone yt-dlp (github, official) + static ffmpeg/ffprobe (evermeet)
+#   1. fetch the pinned yt-dlp, static ffmpeg/ffprobe and Deno (scripts/binaries.lock),
+#      each verified against its SHA-256
 #   2. build the Release app
 #   3. embed the binaries in Contents/Resources/bin
 #   4. ad-hoc sign (so it runs locally / with a one-time right-click→Open)
@@ -17,61 +18,27 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PROJ="$ROOT/VideoProApp/VideoProApp.xcodeproj"
 DIST="$ROOT/dist"
-# Cache the downloaded tools OUTSIDE dist/. dist/ gets wiped on every run, so
-# keeping them in there meant a flaky mirror (martin-riedl 522s) destroyed the
-# ability to build at all — right after the old build had been replaced.
-CACHE="$ROOT/.cache/bin"
 BIN="$DIST/bin"
 BUILD="$DIST/build"
 APP="$DIST/VideoPro.app"
 
 rm -rf "$DIST"
-mkdir -p "$BIN" "$BUILD" "$CACHE"
+mkdir -p "$BIN" "$BUILD"
 
-# ── 1. binaries (cached; re-download only when missing) ──────────────────────
-fetch_retry () {  # $1 = url, $2 = output
-  for attempt in 1 2 3; do
-    curl -L --fail --progress-bar --max-time 180 "$1" -o "$2" && return 0
-    echo "  ⚠ attempt $attempt failed; retrying…" >&2
-    sleep 3
-  done
-  return 1
-}
+# ── 1. binaries (pinned + verified; cached in .cache/downloads) ──────────────
+# Downloads live OUTSIDE dist/, which is wiped on every run: a flaky mirror
+# (martin-riedl 522s) once destroyed the ability to build at all, right after
+# the old build had been replaced. Cached files are re-hashed before use.
+# shellcheck source=tools.sh
+source "$ROOT/scripts/tools.sh"
+fetch_tools "$BIN"
 
-if [ ! -x "$CACHE/yt-dlp" ]; then
-  echo "→ fetching yt-dlp (official standalone)…"
-  fetch_retry "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_macos" "$CACHE/yt-dlp" \
-    || { echo "✗ couldn't fetch yt-dlp"; exit 1; }
-  chmod +x "$CACHE/yt-dlp"
+# A stale yt-dlp is the likeliest way for a release to ship broken: YouTube
+# starts refusing versions a few months old.
+AGE="$(ytdlp_pin_age_days)"
+if [ "$AGE" -gt 60 ]; then
+  echo "⚠ the pinned yt-dlp ($YTDLP_VERSION) is $AGE days old — run scripts/pin-binaries.sh before releasing"
 fi
-
-ARCH="$(uname -m)"; MR_ARCH="arm64"; [ "$ARCH" = "x86_64" ] && MR_ARCH="amd64"
-fetch_ff () {
-  local name="$1"
-  [ -x "$CACHE/$name" ] && return 0
-  echo "→ fetching $name (static, $MR_ARCH)…"
-  local tmp; tmp="$(mktemp -d)"
-  fetch_retry "https://ffmpeg.martin-riedl.de/redirect/latest/macos/$MR_ARCH/release/$name.zip" "$tmp/$name.zip" \
-    || { echo "✗ couldn't fetch $name (mirror down?). Cached copy would have been used if present."; rm -rf "$tmp"; exit 1; }
-  ( cd "$tmp" && unzip -oq "$name.zip" )
-  mv "$tmp/$name" "$CACHE/$name"; chmod +x "$CACHE/$name"; rm -rf "$tmp"
-}
-fetch_ff ffmpeg
-fetch_ff ffprobe
-
-cp "$CACHE/yt-dlp" "$CACHE/ffmpeg" "$CACHE/ffprobe" "$BIN/"
-chmod +x "$BIN"/*
-xattr -cr "$BIN" 2>/dev/null || true
-echo "✓ tools ready (cached in .cache/bin — delete it to force a refresh)"
-
-# ── 1b. refresh bundled extension ────────────────────────────────────────────
-# extension.zip and the Safari target's Resources are BUILD INPUTS copied from
-# extension/. Regenerate them here so a release can never ship a stale copy of
-# the extension while the source tree looks up to date.
-echo "→ refreshing bundled extension from extension/…"
-bash "$ROOT/scripts/bundle-extension.sh" >/dev/null
-bash "$ROOT/scripts/sync-safari.sh"       >/dev/null
-echo "✓ extension.zip + Safari resources synced"
 
 # ── 2. build Release ─────────────────────────────────────────────────────────
 # Sparkle decides "is this newer?" from CFBundleVersion (sparkle:version), NOT
@@ -93,12 +60,12 @@ cp -R "$BUILD/VideoProApp.app" "$APP"
 # ── 3. embed binaries ────────────────────────────────────────────────────────
 echo "→ embedding binaries…"
 mkdir -p "$APP/Contents/Resources/bin"
-cp "$BIN/yt-dlp" "$BIN/ffmpeg" "$BIN/ffprobe" "$APP/Contents/Resources/bin/"
+cp "$BIN/yt-dlp" "$BIN/ffmpeg" "$BIN/ffprobe" "$BIN/deno" "$APP/Contents/Resources/bin/"
 chmod +x "$APP/Contents/Resources/bin/"*
 
 # ── 4. ad-hoc sign (nested first, then the app) ──────────────────────────────
 echo "→ signing (ad-hoc)…"
-for b in yt-dlp ffmpeg ffprobe; do
+for b in yt-dlp ffmpeg ffprobe deno; do
   codesign --force -s - "$APP/Contents/Resources/bin/$b"
 done
 codesign --force -s - "$APP"
@@ -120,6 +87,12 @@ echo
 echo "Bundled tool versions (from inside the .app):"
 "$APP/Contents/Resources/bin/yt-dlp" --version 2>/dev/null | sed 's/^/   yt-dlp /'
 "$APP/Contents/Resources/bin/ffmpeg" -version 2>/dev/null | head -1 | sed 's/^/   /'
+"$APP/Contents/Resources/bin/deno" --version 2>/dev/null | head -1 | sed 's/^/   /'
+# yt-dlp has to actually find the bundled runtime, not merely have it nearby.
+# Captured first: with no URL yt-dlp exits 2, which pipefail would turn into a
+# failed build.
+YT_DEBUG="$("$APP/Contents/Resources/bin/yt-dlp" -v --js-runtimes "deno:$APP/Contents/Resources/bin/deno" 2>&1 || true)"
+echo "$YT_DEBUG" | grep "JS runtimes" | head -1 | sed 's/^\[debug\] /   yt-dlp sees /'
 echo
 echo "── To distribute to ANYONE (frictionless), notarize with your Apple ID: ──"
 cat <<'NOTARIZE'
