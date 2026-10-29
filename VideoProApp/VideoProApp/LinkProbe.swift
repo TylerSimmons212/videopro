@@ -131,7 +131,7 @@ extension DownloadManager {
         process.arguments = [
             "-J", "--flat-playlist", "--no-playlist", "--no-warnings",
             "--playlist-items", "\(start):\(start + pageSize - 1)",
-        ] + cookieArgs + Self.target(url)
+        ] + commonArgs + Self.target(url)
         let out = Pipe(), err = Pipe()
         process.standardOutput = out
         process.standardError = err

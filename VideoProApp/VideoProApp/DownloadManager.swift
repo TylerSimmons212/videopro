@@ -56,6 +56,21 @@ final class DownloadManager {
         return ["--cookies-from-browser", cookieSpec]
     }
 
+    /// The JavaScript runtime yt-dlp needs for YouTube's challenges: the bundled
+    /// Deno, or Homebrew's in a development build. yt-dlp only looks on PATH,
+    /// and an app opened from Finder gets a PATH without Homebrew — so without
+    /// this it ran runtime-less, saw fewer formats (49 of 57 on a test video),
+    /// and relied on a fallback yt-dlp has deprecated.
+    var denoPath: String? { locate("deno") }
+
+    /// What every yt-dlp call carries: sign-in cookies when opted in, and the
+    /// JavaScript runtime when there is one.
+    var commonArgs: [String] {
+        var args = cookieArgs
+        if let deno = denoPath { args += ["--js-runtimes", "deno:\(deno)"] }
+        return args
+    }
+
     // MARK: - Binary discovery
 
     /// Search order: bundled Resources/bin, then common install locations.
@@ -83,11 +98,13 @@ final class DownloadManager {
     struct ToolStatus {
         let ytDlp: String?
         let ffmpeg: String?
+        let ffprobe: String?
+        let deno: String?
         var ready: Bool { ytDlp != nil }
     }
 
     func toolStatus() -> ToolStatus {
-        ToolStatus(ytDlp: ytDlpPath, ffmpeg: locate("ffmpeg"))
+        ToolStatus(ytDlp: ytDlpPath, ffmpeg: locate("ffmpeg"), ffprobe: locate("ffprobe"), deno: denoPath)
     }
 
     // MARK: - Download
@@ -123,8 +140,15 @@ final class DownloadManager {
             "--socket-timeout", "30",
             "--retries", "5",
             "--fragment-retries", "5",
+            // A subtitle or thumbnail that can't be fetched must not cost the
+            // video. Without this, yt-dlp treats a failed subtitle as fatal, and
+            // YouTube rate-limits subtitle requests (HTTP 429) far more readily
+            // than video — so downloads failed outright with nothing saved. Real
+            // failures (unavailable, no such format, unsupported page) still
+            // exit non-zero with this on; only these extras become warnings.
+            "--ignore-errors",
             "-o", folder.appendingPathComponent("%(title)s.%(ext)s").path,
-        ] + cookieArgs
+        ] + commonArgs
         if let ff = ffmpegDirectory {
             args += ["--ffmpeg-location", ff]
         }
@@ -340,7 +364,7 @@ final class DownloadManager {
             "--newline", "--no-playlist", "--no-part", "--restrict-filenames",
             "-f", format,
             "-o", folder.appendingPathComponent("source.%(ext)s").path,
-        ] + cookieArgs
+        ] + commonArgs
         if let ff = ffmpegDirectory { args += ["--ffmpeg-location", ff] }
         if let range {
             // Section downloads are cut by ffmpeg, so they need it on PATH.
@@ -409,7 +433,7 @@ final class DownloadManager {
     /// Returns a direct, AVPlayer-friendly URL by asking yt-dlp for it.
     func resolvePlayableURL(for meta: VideoMeta) async -> URL? {
         guard let ytdlp = ytDlpPath else { return nil }
-        let cookies = cookieArgs
+        let cookies = commonArgs
         return await withCheckedContinuation { continuation in
             probeQueue.addOperation {
                 let process = Process()
@@ -617,7 +641,7 @@ final class DownloadManager {
     /// distinct heights it offers. Best-effort; nil on failure.
     func fetchInfo(for meta: VideoMeta) async -> VideoInfo? {
         guard let ytdlp = ytDlpPath else { return nil }
-        let cookies = cookieArgs
+        let cookies = commonArgs
         return await withCheckedContinuation { continuation in
             probeQueue.addOperation {
                 let process = Process()

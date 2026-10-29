@@ -204,6 +204,13 @@ Downloader parity with Downbit, built on yt-dlp rather than a rewrite.
   by a per-install secret) cover what it did. The one thing lost is a fallback for
   pages yt-dlp can't read — a built-in browser is the replacement.
 
+Followed by the bundled tools: **Deno** ships in `Resources/bin` and every yt-dlp call
+gets `--js-runtimes deno:<path>` (an app opened from Finder has no Homebrew on its
+PATH, so yt-dlp ran runtime-less and saw 49 of 57 formats on a test video). Deno is
+signed with its own JIT entitlements; with yt-dlp's it crashes under Hardened Runtime.
+All four tools are **pinned** in `scripts/binaries.lock` by URL and SHA-256, verified
+against each publisher's checksums by `scripts/pin-binaries.sh`.
+
 Findings worth keeping: the capped presets prefer H.264 over resolution, so on YouTube
 "2160p (4K)" yields 1080p; the link field labels each choice with what it really gets,
 but the old quality menu still says 2160p. And a format with no codec listed (any
@@ -216,8 +223,6 @@ look audio-only.
   can't read; its sign-ins exported as a cookie file for `--cookies`.
 - Playlist options beyond the grid: subscriptions (`--download-archive`), live
   recording, SponsorBlock, more formats, file-name templates.
-- Bundle a JavaScript runtime (Deno) for yt-dlp's YouTube challenge solving.
-- Pin yt-dlp/ffmpeg downloads to checksums in `fetch-binaries.sh`.
 
 ---
 
@@ -232,6 +237,11 @@ Fixed:
   live downloads. It now runs once.
 - Removing an item mid-download left yt-dlp running; it now stops it.
 - ⌘A shadowed select-all in the search field; it now stands aside while the field has focus.
+- A subtitle request rejected with HTTP 429 failed the whole download with nothing
+  saved — yt-dlp treats subtitle errors as fatal, and YouTube rate-limits subtitles
+  far sooner than video. Downloads pass `--ignore-errors`; real failures still exit
+  non-zero.
+- `toolSummary` now reports ffprobe and Deno as well as yt-dlp and ffmpeg.
 
 - Download preferences were never persisted — reset on every launch.
 - Generated thumbnails were never cleaned up; `remove()` now prunes them.
@@ -247,7 +257,6 @@ Fixed:
 Still outstanding:
 
 - `moveToApplications` destroys an existing install before the copy succeeds.
-- `toolSummary` never mentions ffprobe, so a missing one is unexplained.
 
 ## Non-goals
 

@@ -45,6 +45,9 @@ echo "→ signing bundled binaries (Developer ID + hardened runtime)…"
 codesign --force --timestamp --options runtime --entitlements "$ENT" -s "$DEV_ID" "$APP/Contents/Resources/bin/yt-dlp"
 codesign --force --timestamp --options runtime                        -s "$DEV_ID" "$APP/Contents/Resources/bin/ffmpeg"
 codesign --force --timestamp --options runtime                        -s "$DEV_ID" "$APP/Contents/Resources/bin/ffprobe"
+# Deno needs the JIT entitlements it ships with; see scripts/deno-entitlements.plist.
+codesign --force --timestamp --options runtime --entitlements "$ROOT/scripts/deno-entitlements.plist" \
+  -s "$DEV_ID" "$APP/Contents/Resources/bin/deno"
 
 echo "→ signing the app…"
 codesign --force --timestamp --options runtime -s "$DEV_ID" "$APP"

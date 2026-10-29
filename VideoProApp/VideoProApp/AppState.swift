@@ -411,7 +411,9 @@ final class AppState: ObservableObject {
         toolsReady = status.ready
         if let yt = status.ytDlp {
             let ff = status.ffmpeg != nil ? "ffmpeg ✓" : "ffmpeg ✗ (muxing limited)"
-            toolSummary = "yt-dlp: \((yt as NSString).lastPathComponent) · \(ff)"
+            let probe = status.ffprobe != nil ? "ffprobe ✓" : "ffprobe ✗ (no media details)"
+            let deno = status.deno != nil ? "deno ✓" : "deno ✗ (fewer YouTube formats)"
+            toolSummary = "yt-dlp: \((yt as NSString).lastPathComponent) · \(ff) · \(probe) · \(deno)"
         } else {
             toolSummary = "yt-dlp not found — install with `brew install yt-dlp`"
         }

@@ -67,10 +67,11 @@ scripts/
 
 ## Run it (development)
 
-Needs `yt-dlp` and `ffmpeg`, and yt-dlp has to be **current** — YouTube refuses
-downloads from versions a few months old (HTTP 403):
+Needs `yt-dlp`, `ffmpeg` and `deno` (yt-dlp's JavaScript runtime for YouTube), and
+yt-dlp has to be **current** — YouTube refuses downloads from versions a few months
+old (HTTP 403). Homebrew's yt-dlp brings Deno with it:
 ```bash
-brew install yt-dlp ffmpeg     # or bundle them (see Distribution)
+brew install yt-dlp ffmpeg     # or: bash scripts/fetch-binaries.sh (the pinned set)
 brew upgrade yt-dlp            # whenever YouTube downloads start failing
 open VideoProApp/VideoProApp.xcodeproj   # then ⌘R
 ```
@@ -80,9 +81,18 @@ open VideoProApp/VideoProApp.xcodeproj   # then ⌘R
 ```bash
 bash scripts/package-app.sh
 ```
-Downloads the **official yt-dlp** + a **static, arch-matched ffmpeg**, builds the Release
-app with them embedded in `Contents/Resources/bin/`, ad-hoc signs it, and produces
-`dist/VideoPro.dmg` — which runs on any Mac **without Homebrew**.
+Downloads the **official yt-dlp**, a **static, arch-matched ffmpeg/ffprobe** and **Deno**
+(so yt-dlp can solve YouTube's JavaScript challenges and see every format), builds the
+Release app with them embedded in `Contents/Resources/bin/`, ad-hoc signs it, and
+produces `dist/VideoPro.dmg` — which runs on any Mac **without Homebrew**.
+
+The tools are **pinned**: `scripts/binaries.lock` holds each file's URL and SHA-256,
+and the build refuses anything that doesn't match. Bump the pins before every release
+— yt-dlp above all — and commit the lock:
+```bash
+bash scripts/pin-binaries.sh   # latest releases, each checked against its publisher's checksum
+```
+`package-app.sh` warns once the pinned yt-dlp is more than 60 days old.
 
 For frictionless distribution to anyone, notarize with your **Apple Developer ID**:
 ```bash
@@ -92,6 +102,8 @@ xcrun notarytool store-credentials VIDEOPRO \
 
 bash scripts/notarize.sh   # signs (hardened runtime + entitlements), submits, staples
 ```
+Deno is signed with its own entitlements (`scripts/deno-entitlements.plist`): its
+JavaScript engine needs JIT, which the hardened runtime otherwise refuses.
 Until notarized, recipients right-click → **Open** once to bypass Gatekeeper's
 "unidentified developer" prompt.
 
