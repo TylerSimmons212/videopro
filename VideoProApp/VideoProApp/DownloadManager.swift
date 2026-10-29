@@ -63,6 +63,27 @@ final class DownloadManager {
     /// and relied on a fallback yt-dlp has deprecated.
     var denoPath: String? { locate("deno") }
 
+    /// The environment for every yt-dlp, ffmpeg and ffprobe the app starts.
+    ///
+    /// The bundled static ffmpeg carries its own OpenSSL, which looks for CA
+    /// certificates where its build machine kept them — a path that doesn't
+    /// exist on anyone else's Mac — and recent ffmpeg verifies certificates by
+    /// default. So every https input failed with "certificate verify failed":
+    /// clipping a video that isn't downloaded yet, the fallback thumbnail grab,
+    /// and any download yt-dlp hands to ffmpeg. macOS ships a CA bundle at
+    /// /etc/ssl/cert.pem; pointing OpenSSL at it fixes all of them. yt-dlp passes
+    /// its environment on to the ffmpeg it runs, so setting it there covers that
+    /// path too. Homebrew's ffmpeg finds its own certificates, which is why
+    /// development builds never showed this.
+    nonisolated static let toolEnvironment: [String: String] = {
+        var env = ProcessInfo.processInfo.environment
+        let bundle = "/etc/ssl/cert.pem"
+        if env["SSL_CERT_FILE"] == nil, FileManager.default.fileExists(atPath: bundle) {
+            env["SSL_CERT_FILE"] = bundle
+        }
+        return env
+    }()
+
     /// What every yt-dlp call carries: sign-in cookies when opted in, and the
     /// JavaScript runtime when there is one.
     var commonArgs: [String] {
@@ -173,6 +194,7 @@ final class DownloadManager {
 
         let process = Process()
         process.executableURL = URL(fileURLWithPath: ytdlp)
+        process.environment = Self.toolEnvironment
         process.arguments = args + Self.target(url)
         process.currentDirectoryURL = folder
 
@@ -373,6 +395,7 @@ final class DownloadManager {
 
         let process = Process()
         process.executableURL = URL(fileURLWithPath: ytdlp)
+        process.environment = Self.toolEnvironment
         process.arguments = args + Self.target(item.meta.downloadURL)
         process.currentDirectoryURL = folder
 
@@ -438,6 +461,7 @@ final class DownloadManager {
             probeQueue.addOperation {
                 let process = Process()
                 process.executableURL = URL(fileURLWithPath: ytdlp)
+                process.environment = Self.toolEnvironment
                 // Prefer a single progressive mp4 so AVPlayer gets one stream.
                 process.arguments = [
                     "-g", "-f", "b[ext=mp4]/b", "--no-playlist",
@@ -494,6 +518,7 @@ final class DownloadManager {
 
         let process = Process()
         process.executableURL = URL(fileURLWithPath: ffmpeg)
+        process.environment = Self.toolEnvironment
         process.arguments = args
 
         // Both pipes must be drained. ffmpeg writes a progress line to stderr
@@ -578,6 +603,7 @@ final class DownloadManager {
             probeQueue.addOperation {
                 let process = Process()
                 process.executableURL = URL(fileURLWithPath: ffmpeg)
+                process.environment = Self.toolEnvironment
                 process.arguments = [
                     "-y", "-nostdin",
                     "-ss", String(seek),
@@ -646,6 +672,7 @@ final class DownloadManager {
             probeQueue.addOperation {
                 let process = Process()
                 process.executableURL = URL(fileURLWithPath: ytdlp)
+                process.environment = Self.toolEnvironment
                 process.arguments = ["-J", "--no-playlist", "--no-warnings"] + cookies + Self.target(meta.downloadURL)
                 let out = Pipe()
                 process.standardOutput = out

@@ -128,6 +128,7 @@ extension DownloadManager {
         let pageSize = Self.linkPageSize
         let process = Process()
         process.executableURL = URL(fileURLWithPath: ytdlp)
+        process.environment = Self.toolEnvironment
         process.arguments = [
             "-J", "--flat-playlist", "--no-playlist", "--no-warnings",
             "--playlist-items", "\(start):\(start + pageSize - 1)",

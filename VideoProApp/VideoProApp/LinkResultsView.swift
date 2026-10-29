@@ -138,10 +138,16 @@ private struct SingleVideoCard: View {
                             }
                         }
                     }
-                    if let c = selected, let codec = c.codec, codec != "H.264", !c.isAudio {
-                        Label("\(codec) gives the highest resolution but may not play in QuickTime or on older devices.",
+                    if let c = selected, let codec = c.codec, !c.isAudio,
+                       !QuickTimeCompat.canPlay(codec: codec) {
+                        // Say what will actually happen on *this* Mac, not "may not
+                        // play": an M1 can't decode AV1 or VP9 at all.
+                        Label(state.convertForQuickTime
+                              ? "QuickTime can’t play \(codec) on this Mac, so VideoPro converts it to HEVC after downloading. That takes about as long as the video itself."
+                              : "QuickTime can’t play \(codec) on this Mac. Turn on conversion in Settings → Downloads, or play it in IINA or VLC.",
                               systemImage: "info.circle")
                             .font(.caption).foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
                     }
                 }
 

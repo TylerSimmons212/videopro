@@ -34,6 +34,9 @@ from a native macOS app.
   downloads where they are; they carry on at the next launch.
 - **Download queue** with a concurrency limit and an Activity popover (cancel, history).
 - **Quality picker** per video, probed live; prefers H.264/AAC for universal playback.
+- **Plays in QuickTime.** Above 1080p YouTube sends AV1 or VP9, which QuickTime can't
+  play on Macs before M3; such downloads are re-encoded to HEVC on the hardware encoder
+  (Settings → Downloads). The picker says up front when a quality needs it.
 - Embeds **thumbnail + subtitles + metadata**. The Mac stays awake while downloading.
 
 **Library and editing**

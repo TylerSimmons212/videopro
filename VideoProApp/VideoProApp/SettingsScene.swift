@@ -114,6 +114,16 @@ private struct DownloadSettingsTab: View {
                     .font(.caption).foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
+
+            Section {
+                Toggle(isOn: $state.convertForQuickTime) {
+                    Label("Convert videos QuickTime can’t play", systemImage: "arrow.triangle.2.circlepath")
+                }
+            } footer: {
+                Text("Above 1080p, YouTube sends AV1 or VP9, which QuickTime can’t play on Macs before M3. VideoPro re-encodes those downloads to HEVC on the Mac’s hardware encoder — about as long as the video itself for 4K — and replaces the original. Off keeps the original, for IINA or VLC.")
+                    .font(.caption).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
         }
         .settingsForm()
     }

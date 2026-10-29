@@ -9,6 +9,9 @@ enum JobKind: Equatable, Sendable {
     /// Joining a collection into one file. Shares the export lane: it is the same
     /// CPU-bound ffmpeg work, just N+1 processes instead of one or two.
     case buildCollection(String)
+    /// Re-encoding a download to HEVC because this Mac's QuickTime can't play
+    /// it. CPU/encoder work, so it shares the export lane too.
+    case convert
 
     /// What the user is told this job is. Kept here so a row, a notification and
     /// a log line can never describe the same job differently.
@@ -17,6 +20,7 @@ enum JobKind: Equatable, Sendable {
         case .download(let q): return "Download · \(q.rawValue)"
         case .export(let t):   return "Export · \(t.displayName)"
         case .buildCollection(let name): return "Build · \(name)"
+        case .convert:         return "Convert · HEVC for QuickTime"
         }
     }
 
@@ -25,6 +29,7 @@ enum JobKind: Equatable, Sendable {
         case .download: return "arrow.down.circle"
         case .export:   return "square.and.arrow.up.on.square"
         case .buildCollection: return "film.stack"
+        case .convert:  return "arrow.triangle.2.circlepath"
         }
     }
 }
@@ -212,6 +217,7 @@ final class JobCenter: ObservableObject {
         case .download: return .download
         case .export:   return .export
         case .buildCollection: return .export
+        case .convert: return .export
         }
     }
 

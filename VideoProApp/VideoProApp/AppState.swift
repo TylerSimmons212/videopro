@@ -42,6 +42,10 @@ final class AppState: ObservableObject {
     /// Put a link copied in another app into the field when coming back.
     @Published var offerCopiedLinks = true { didSet { persistPrefs() } }
 
+    /// Convert a finished download to HEVC when this Mac's QuickTime can't play
+    /// it — YouTube's 4K is AV1 or VP9, which Macs before M3 can't decode.
+    @Published var convertForQuickTime = true { didSet { persistPrefs() } }
+
     /// Mirrors JobCenter so views observing AppState still repaint when work
     /// starts or finishes. The queue itself lives in JobCenter now.
     let jobs = JobCenter.shared
@@ -125,6 +129,7 @@ final class AppState: ObservableObject {
         static let hotKeyCode = "hotKeyCode"
         static let hotKeyModifiers = "hotKeyModifiers"
         static let offerLinks = "offerCopiedLinks"
+        static let convertQT = "convertForQuickTime"
     }
 
     private var loadingPrefs = false
@@ -152,6 +157,9 @@ final class AppState: ObservableObject {
         if d.object(forKey: PrefKey.offerLinks) != nil {
             offerCopiedLinks = d.bool(forKey: PrefKey.offerLinks)
         }
+        if d.object(forKey: PrefKey.convertQT) != nil {
+            convertForQuickTime = d.bool(forKey: PrefKey.convertQT)
+        }
     }
 
     private func persistPrefs() {
@@ -165,6 +173,7 @@ final class AppState: ObservableObject {
         d.set(Int(hotKeyCombo.keyCode), forKey: PrefKey.hotKeyCode)
         d.set(Int(hotKeyCombo.modifiers), forKey: PrefKey.hotKeyModifiers)
         d.set(offerCopiedLinks, forKey: PrefKey.offerLinks)
+        d.set(convertForQuickTime, forKey: PrefKey.convertQT)
     }
 
     /// The browser cookies are currently being borrowed from, if any.
@@ -218,6 +227,8 @@ final class AppState: ObservableObject {
         let interrupted = resumeOnLaunch
         resumeOnLaunch = []
         for item in interrupted { download(item) }
+
+        removeAbandonedConversions()
 
         NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)
             .sink { [weak self] _ in self?.offerCopiedLink() }
@@ -1039,6 +1050,12 @@ final class AppState: ObservableObject {
             item.meta.pending?.progress = item.progress
         }
         DownloadManager.shared.stopAllForQuit()
+        // A conversion's ffmpeg would outlive us too. Cancelling stops it; the
+        // original file was never touched, and the half-written copy is swept
+        // up at the next launch.
+        for job in JobCenter.shared.active where job.kind == .convert {
+            JobCenter.shared.cancel(job)
+        }
         saveLibrary()
     }
 
@@ -1050,6 +1067,7 @@ final class AppState: ObservableObject {
             saveLibrary()
         }
         notifyComplete(item)
+        convertIfUnplayable(item)
     }
 
     // MARK: - Notifications

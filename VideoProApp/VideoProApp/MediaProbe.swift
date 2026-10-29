@@ -94,6 +94,7 @@ final class MediaProbe {
             queue.addOperation {
                 let process = Process()
                 process.executableURL = URL(fileURLWithPath: ffprobe)
+                process.environment = DownloadManager.toolEnvironment
                 process.arguments = [
                     "-v", "quiet",
                     "-print_format", "json",

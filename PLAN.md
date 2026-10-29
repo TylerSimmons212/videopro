@@ -211,6 +211,24 @@ signed with its own JIT entitlements; with yt-dlp's it crashes under Hardened Ru
 All four tools are **pinned** in `scripts/binaries.lock` by URL and SHA-256, verified
 against each publisher's checksums by `scripts/pin-binaries.sh`.
 
+Then two fixes found by testing the packaged app on an M1 Pro:
+
+- **The bundled ffmpeg couldn't verify HTTPS.** Its static OpenSSL looks for CA
+  certificates at its build machine's path, and recent ffmpeg verifies by default,
+  so clipping an undownloaded video and the thumbnail fallback failed with
+  "certificate verify failed". Every tool process now gets
+  `SSL_CERT_FILE=/etc/ssl/cert.pem` (`DownloadManager.toolEnvironment`); yt-dlp
+  passes it on to the ffmpeg it runs. Development builds use Homebrew's ffmpeg,
+  which finds its own certificates, so this only showed in packaged builds.
+- **4K downloads didn't open in QuickTime.** YouTube serves H.264 only to 1080p;
+  above that it's AV1 or VP9. AVFoundation decodes VP9 on no Mac and AV1 only with
+  a hardware decoder (M3+). After a download, `QuickTimeCompat` asks AVFoundation
+  whether the file's video is decodable; if not, it's re-encoded to HEVC with
+  `hevc_videotoolbox` (about 0.8× real time for 4K60 on an M1 Pro), keeping audio,
+  subtitles, chapters, metadata and cover art, and swapped in at the same path. On
+  by default; imported files are never touched. A conversion cut off by quitting
+  is cleaned up but not restarted.
+
 Findings worth keeping: the capped presets prefer H.264 over resolution, so on YouTube
 "2160p (4K)" yields 1080p; the link field labels each choice with what it really gets,
 but the old quality menu still says 2160p. And a format with no codec listed (any
