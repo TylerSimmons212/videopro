@@ -1,6 +1,7 @@
 import AppKit
 
-/// A browser we can install the VideoPro extension into.
+/// A browser VideoPro can read the current tab from, and borrow sign-in
+/// cookies from for yt-dlp.
 struct BrowserTarget: Identifiable, Hashable {
     enum Kind { case chromium, safari }
 
@@ -8,11 +9,6 @@ struct BrowserTarget: Identifiable, Hashable {
     let name: String
     let kind: Kind
     let appURL: URL
-
-    /// The page where this browser manages extensions. Chromium browsers accept
-    /// their `chrome://` URLs on the command line (verified on Arc), so we can
-    /// deep-link the user straight there instead of describing where to click.
-    var extensionsPage: String { "chrome://extensions" }
 
     /// How to name this browser to `yt-dlp --cookies-from-browser`.
     ///
@@ -52,7 +48,7 @@ struct BrowserTarget: Identifiable, Hashable {
 }
 
 enum BrowserScan {
-    /// Chromium forks we know how to set up, plus Safari. Order = display order.
+    /// Chromium forks we know how to read, plus Safari. Order = display order.
     ///
     /// Detection is by bundle identifier through LaunchServices — deliberately
     /// NOT by looking for `~/Library/Application Support/<Browser>`, because an
@@ -76,15 +72,6 @@ enum BrowserScan {
                 .urlForApplication(withBundleIdentifier: entry.id) else { return nil }
             return BrowserTarget(id: entry.id, name: entry.name, kind: entry.kind, appURL: url)
         }
-    }
-
-    /// Chromium browsers only — the ones that take the unpacked-folder flow.
-    static func chromiumInstalled() -> [BrowserTarget] {
-        installed().filter { $0.kind == .chromium }
-    }
-
-    static func safariInstalled() -> BrowserTarget? {
-        installed().first { $0.kind == .safari }
     }
 
     /// Is this bundle id one of the browsers we can read a tab URL out of?

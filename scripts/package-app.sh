@@ -64,15 +64,6 @@ chmod +x "$BIN"/*
 xattr -cr "$BIN" 2>/dev/null || true
 echo "✓ tools ready (cached in .cache/bin — delete it to force a refresh)"
 
-# ── 1b. refresh bundled extension ────────────────────────────────────────────
-# extension.zip and the Safari target's Resources are BUILD INPUTS copied from
-# extension/. Regenerate them here so a release can never ship a stale copy of
-# the extension while the source tree looks up to date.
-echo "→ refreshing bundled extension from extension/…"
-bash "$ROOT/scripts/bundle-extension.sh" >/dev/null
-bash "$ROOT/scripts/sync-safari.sh"       >/dev/null
-echo "✓ extension.zip + Safari resources synced"
-
 # ── 2. build Release ─────────────────────────────────────────────────────────
 # Sparkle decides "is this newer?" from CFBundleVersion (sparkle:version), NOT
 # from the marketing version. The project hard-codes CURRENT_PROJECT_VERSION = 1,

@@ -168,6 +168,7 @@ private struct FinishedJobRow: View {
         case .succeeded: return "checkmark.circle.fill"
         case .failed:    return "exclamationmark.triangle.fill"
         case .cancelled: return "slash.circle"
+        case .paused:    return "pause.circle"
         default:         return "circle"
         }
     }
@@ -177,6 +178,9 @@ private struct FinishedJobRow: View {
         case .succeeded:         return job.kind.label
         case .failed(let why):   return why
         case .cancelled:         return "Cancelled · \(job.kind.label)"
+        // Resumed from the library row rather than here: a Resume button on a
+        // history entry could start a second copy of a download already resumed.
+        case .paused:            return "Paused · resume it from the library"
         default:                 return job.kind.label
         }
     }

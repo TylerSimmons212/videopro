@@ -35,6 +35,10 @@ enum JobState: Equatable, Sendable {
     case succeeded
     case failed(String)
     case cancelled
+    /// Stopped by the user with its partial data kept. Terminal for the *job* —
+    /// it gives its slot back — and resuming starts a fresh job that picks the
+    /// data up, the same way a retry does.
+    case paused
 }
 
 /// One unit of user-visible work.
@@ -63,6 +67,9 @@ final class Job: ObservableObject, Identifiable {
     /// process). Cancelling a job that never set this still settles the job —
     /// the work simply finds itself orphaned and its result ignored.
     var onCancel: (() -> Void)?
+    /// Like `onCancel`, but the work stops keeping what it has. Unset for work
+    /// that can't be resumed, which is then simply stopped.
+    var onPause: (() -> Void)?
 
     init(itemID: UUID, title: String, kind: JobKind) {
         self.id = UUID()
@@ -172,6 +179,14 @@ final class JobCenter: ObservableObject {
         for job in jobs where job.isActive { cancel(job) }
     }
 
+    /// Stop a job and free its slot, keeping whatever it has done so far.
+    func pause(_ job: Job) {
+        guard job.isActive else { return }
+        if let onPause = job.onPause { onPause() } else { job.onCancel?() }
+        stopTask(for: job.id)
+        finish(job, .paused)
+    }
+
     /// Re-runs the original work on a *fresh* job, leaving the failed one in
     /// history.
     ///
@@ -240,6 +255,7 @@ final class JobCenter: ObservableObject {
     private func finish(_ job: Job, _ state: JobState) {
         job.markFinished(state)
         job.onCancel = nil
+        job.onPause = nil
         objectWillChange.send()
         trimHistory()
         pump(lane(of: job.kind))

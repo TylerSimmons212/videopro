@@ -89,7 +89,7 @@ enum StatusFilter: String, CaseIterable, Identifiable {
     func matches(_ item: VideoItem) -> Bool {
         switch self {
         case .all: return true
-        case .downloading: return item.status == .downloading || item.status == .queued
+        case .downloading: return item.status.isUnfinished
         case .done: return item.status == .done
         case .failed: return item.status == .error
         }
@@ -295,14 +295,13 @@ struct RenameSheet: View {
 
 struct LibraryView: View {
     @EnvironmentObject var state: AppState
+    /// The field at the top: a link shows what's there, anything else searches.
+    @EnvironmentObject var linkSearch: LinkSearch
     let scope: LibraryScope
 
     @Environment(\.openWindow) private var openWindow
     @State private var convertItem: VideoItem?
-    @State private var showAddURL = false
     @State private var showActivity = false
-    @State private var urlText = ""
-    @State private var search = ""
     @State private var status: StatusFilter = .all
     @State private var dropTargeted = false
     @State private var showInspector = false
@@ -316,7 +315,7 @@ struct LibraryView: View {
 
     private var visible: [VideoItem] {
         var list = scoped.filter(status.matches)
-        let q = search.trimmingCharacters(in: .whitespaces).lowercased()
+        let q = linkSearch.librarySearch.trimmingCharacters(in: .whitespaces).lowercased()
         if !q.isEmpty {
             list = list.filter {
                 $0.meta.title.lowercased().contains(q)
@@ -339,16 +338,18 @@ struct LibraryView: View {
         // reserved its height even in the branches that don't show it — leaving a
         // band of dead space under the toolbar on the empty states.
         VStack(spacing: 0) {
-            if showsFilterBar { filterBar }
+            if showsFilterBar && !linkSearch.isLinkMode { filterBar }
 
             Group {
-                if state.items.isEmpty {
+                if linkSearch.isLinkMode {
+                    LinkResultsView(search: linkSearch)
+                } else if state.items.isEmpty {
                     EmptyStateView()
                 } else if scoped.isEmpty {
                     ContentUnavailableView("Nothing here yet", systemImage: scope.systemImage,
                                            description: Text(emptyScopeHint))
                 } else if visible.isEmpty {
-                    ContentUnavailableView.search(text: search)
+                    ContentUnavailableView.search(text: linkSearch.query)
                 } else {
                     List(selection: $selection) {
                         ForEach(visible) { item in
@@ -413,7 +414,6 @@ struct LibraryView: View {
         }
         .navigationTitle(title)
         .navigationSubtitle(subtitle)
-        .searchable(text: $search, placement: .toolbar, prompt: "Search videos")
         .toolbar { toolbarContent }
         .sheet(item: $convertItem) { EditorView(item: $0).environmentObject(state) }
     }
@@ -459,10 +459,17 @@ struct LibraryView: View {
     /// Zero-sized buttons purely to carry the key equivalents. Escape only
     /// exists while something is selected so it doesn't shadow sheet dismissal.
     @ViewBuilder private var selectionShortcuts: some View {
-        Button("") { selection = Set(visible.map(\.id)) }
+        // Absent while the field has focus, or ⌘A would select rows instead of
+        // the text being typed. In a link's grid it picks every video instead.
+        if !linkSearch.fieldFocused {
+            Button("") {
+                if linkSearch.isLinkMode { linkSearch.selectAll() }
+                else { selection = Set(visible.map(\.id)) }
+            }
             .keyboardShortcut("a", modifiers: .command)
             .frame(width: 0, height: 0).opacity(0)
-        if !selection.isEmpty {
+        }
+        if !selection.isEmpty && !linkSearch.isLinkMode {
             Button("") { selection.removeAll() }
                 .keyboardShortcut(.escape, modifiers: [])
                 .frame(width: 0, height: 0).opacity(0)
@@ -573,7 +580,7 @@ struct LibraryView: View {
 
     @ViewBuilder private var statusFilterBar: some View {
         let counts = Dictionary(grouping: scoped, by: { item -> StatusFilter in
-            if item.status == .downloading || item.status == .queued { return .downloading }
+            if item.status.isUnfinished { return .downloading }
             if item.status == .done { return .done }
             if item.status == .error { return .failed }
             return .all
@@ -608,6 +615,10 @@ struct LibraryView: View {
 
     @ToolbarContentBuilder
     private var toolbarContent: some ToolbarContent {
+        ToolbarItem(placement: .principal) {
+            LinkField(search: linkSearch)
+        }
+
         ToolbarItemGroup(placement: .primaryAction) {
             Button { state.chooseFilesToImport() } label: { Image(systemName: "folder.badge.plus") }
                 .help("Import files from your Mac")
@@ -620,10 +631,6 @@ struct LibraryView: View {
                 }
             } label: { Image(systemName: "info.circle") }
                 .help("Media details")
-
-            Button { showAddURL.toggle() } label: { Image(systemName: "plus") }
-                .help("Add a video by URL")
-                .popover(isPresented: $showAddURL, arrowEdge: .bottom) { addURLPopover }
 
             // In-flight work lives here now instead of taking two sidebar rows.
             // Always present now: it has a history worth opening even when idle.
@@ -652,32 +659,6 @@ struct LibraryView: View {
                     .help("Download everything shown")
             }
         }
-    }
-
-    private var addURLPopover: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Text("Add a video by URL").font(.subheadline).fontWeight(.semibold)
-            Text("Paste any video page or direct link.")
-                .font(.caption).foregroundStyle(.secondary)
-            HStack {
-                TextField("https://…", text: $urlText)
-                    .textFieldStyle(.roundedBorder)
-                    .frame(width: 260)
-                    .onSubmit(submitURL)
-                Button("Add", action: submitURL)
-                    .keyboardShortcut(.defaultAction)
-                    .disabled(urlText.trimmingCharacters(in: .whitespaces).isEmpty)
-            }
-        }
-        .padding(14)
-    }
-
-    private func submitURL() {
-        let t = urlText
-        guard !t.trimmingCharacters(in: .whitespaces).isEmpty else { return }
-        state.addURL(t)
-        urlText = ""
-        showAddURL = false
     }
 
     private func play(_ item: VideoItem) {
@@ -807,9 +788,10 @@ struct VideoRow: View {
         .contextMenu { contextMenu }
     }
 
-    /// While a download is live the Cancel button can't be hover-gated.
+    /// While a download is live — or paused, waiting on the user — its controls
+    /// can't be hover-gated.
     private var alwaysShowControls: Bool {
-        item.status == .downloading || item.status == .queued
+        item.status.isUnfinished
     }
 
     /// macOS convention: right-clicking inside a multi-selection acts on the
@@ -853,8 +835,17 @@ struct VideoRow: View {
 
     @ViewBuilder private var singleMenu: some View {
         Button("Play", action: onPlay)
-        if item.status == .idle || item.status == .error {
-            Button("Download") { state.download(item) }
+        switch item.status {
+        case .idle, .error:
+            Button(item.meta.pending != nil ? "Resume Download" : "Download") { state.download(item) }
+        case .downloading, .queued:
+            Button("Pause Download") { state.pause(item) }
+            Button("Cancel Download") { state.cancel(item) }
+        case .paused:
+            Button("Resume Download") { state.resume(item) }
+            Button("Cancel Download") { state.cancel(item) }
+        case .done:
+            EmptyView()
         }
         Button("Clip · GIF · MP3…", action: onExport)
             .disabled(item.busy || !state.canExport(item))
@@ -918,6 +909,15 @@ struct VideoRow: View {
                 Text(item.statusLine)
                     .font(.caption2).foregroundStyle(.tertiary).lineLimit(1)
             }
+        case .paused:
+            HStack(spacing: 7) {
+                ProgressView(value: item.progress)
+                    .progressViewStyle(.linear)
+                    .tint(.secondary)
+                    .frame(width: 130)
+                Text("Paused · \(Int(item.progress * 100))%")
+                    .font(.caption2).monospacedDigit().foregroundStyle(.secondary)
+            }
         case .done:
             Label(item.meta.isLocal ? "On disk" : "Saved", systemImage: "checkmark.circle.fill")
                 .font(.caption2).foregroundStyle(.green)
@@ -941,7 +941,20 @@ struct VideoRow: View {
         HStack(spacing: 4) {
             switch item.status {
             case .downloading, .queued:
-                iconButton("stop.fill", help: item.status == .queued ? "Remove from queue" : "Cancel") {
+                iconButton("pause.fill", help: "Pause — picks up where it stopped") {
+                    state.pause(item)
+                }
+                iconButton("stop.fill", help: item.status == .queued ? "Remove from queue" : "Cancel and delete what’s downloaded") {
+                    state.cancel(item)
+                }
+            case .paused:
+                Button { state.resume(item) } label: {
+                    Image(systemName: "arrow.down.to.line").font(.system(size: 11))
+                        .frame(width: 26, height: 22)
+                }
+                .buttonStyle(.borderedProminent)
+                .help("Resume")
+                iconButton("stop.fill", help: "Cancel and delete what’s downloaded") {
                     state.cancel(item)
                 }
             case .done:
@@ -1178,119 +1191,11 @@ struct EditorView: View {
     }
 }
 
-/// Guided "Load unpacked" flow.
-///
-/// Chromium's Load-unpacked button opens a bare folder picker with no idea where
-/// to go — and our folder lives in ~/Library, which Finder hides by default. So
-/// we spell out the two ways that actually work (⌘⇧G + paste, or drag from the
-/// Finder window we open) and confirm when the extension connects.
-struct ExtensionInstallSheet: View {
-    @EnvironmentObject var state: AppState
-    let browser: BrowserTarget
-    @Environment(\.dismiss) private var dismiss
-    @State private var copied = false
-    @State private var now = Date()
-    private let tick = Timer.publish(every: 2, on: .main, in: .common).autoconnect()
-
-    private var connected: Bool { state.extensionStatus.connected }
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            HStack(spacing: 9) {
-                Image(systemName: "puzzlepiece.extension.fill")
-                    .font(.title2).foregroundStyle(.tint)
-                VStack(alignment: .leading, spacing: 1) {
-                    Text("Set up in \(browser.name)").font(.title3).fontWeight(.bold)
-                    Text("VideoPro opened \(browser.name)’s Extensions page and copied the folder path.")
-                        .font(.caption).foregroundStyle(.secondary)
-                }
-            }
-
-            VStack(alignment: .leading, spacing: 9) {
-                step(1, "Turn on **Developer mode** — the toggle at the top-right.")
-                step(2, "Click **Load unpacked**. A folder picker opens.")
-                step(3, "Press **⌘⇧G**, paste with **⌘V**, then hit **Return**.")
-                HStack(spacing: 6) {
-                    Image(systemName: "arrow.turn.down.right").foregroundStyle(.tertiary)
-                    Text("Or drag the folder from the Finder window onto the Extensions page.")
-                        .font(.caption).foregroundStyle(.secondary)
-                }
-                .padding(.leading, 22)
-            }
-
-            HStack(spacing: 6) {
-                Text(state.extensionFolder.path)
-                    .font(.system(size: 10, design: .monospaced))
-                    .lineLimit(1).truncationMode(.head)
-                    .textSelection(.enabled)
-                Spacer()
-                Button(copied ? "Copied ✓" : "Copy path") {
-                    NSPasteboard.general.clearContents()
-                    NSPasteboard.general.setString(state.extensionFolder.path, forType: .string)
-                    copied = true
-                }
-                .controlSize(.small)
-            }
-            .padding(8)
-            .background(.quaternary.opacity(0.4), in: .rect(cornerRadius: 7))
-
-            // Closes the loop: the popup pings /health on open, so this flips
-            // green on its own the moment it's really working.
-            HStack(spacing: 7) {
-                if connected {
-                    Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
-                    Text("Connected — you’re all set.").font(.callout).fontWeight(.medium)
-                } else {
-                    ProgressView().controlSize(.small)
-                    Text("Waiting for the extension to connect…")
-                        .font(.callout).foregroundStyle(.secondary)
-                }
-            }
-
-            HStack {
-                Button("Reveal folder") {
-                    NSWorkspace.shared.activateFileViewerSelecting([state.extensionFolder])
-                }
-                Button("Reopen \(browser.name)") { state.setUpExtension(in: browser) }
-                Spacer()
-                Button(connected ? "Done" : "Close") { dismiss() }
-                    .buttonStyle(.borderedProminent)
-                    .keyboardShortcut(.defaultAction)
-            }
-            .controlSize(.small)
-        }
-        .padding(20)
-        .frame(width: 460)
-        .onAppear {
-            // Unpack + open the browser + copy the path as the sheet appears, so
-            // the steps below are true by the time the user reads them.
-            state.setUpExtension(in: browser)
-            copied = true
-        }
-        .onReceive(tick) { now = $0 }
-    }
-
-    @ViewBuilder
-    private func step(_ n: Int, _ markdown: String) -> some View {
-        HStack(alignment: .firstTextBaseline, spacing: 8) {
-            Text("\(n)")
-                .font(.caption2).fontWeight(.bold).foregroundStyle(.white)
-                .frame(width: 16, height: 16)
-                .background(.tint, in: .circle)
-            Text(.init(markdown)).font(.callout)
-        }
-    }
-}
-
 // MARK: - Onboarding
 
 struct OnboardingView: View {
     @EnvironmentObject var state: AppState
     let onDone: () -> Void
-    @State private var installed = false
-    @State private var chromium: [BrowserTarget] = []
-    @State private var safari: BrowserTarget?
-    @State private var sheetBrowser: BrowserTarget?
 
     var body: some View {
         ZStack {
@@ -1299,56 +1204,21 @@ struct OnboardingView: View {
                 Image(systemName: "play.rectangle.on.rectangle.fill")
                     .font(.system(size: 46)).foregroundStyle(Color.accentColor.gradient)
                 Text("Welcome to VideoPro").font(.title2).fontWeight(.bold)
-                Text("Find videos in your browser, then send them here to play or download.")
+                Text("Download video and audio from the web, then clip, convert or join it.")
                     .font(.callout).foregroundStyle(.secondary)
                     .multilineTextAlignment(.center).frame(maxWidth: 350)
 
-                VStack(alignment: .leading, spacing: 10) {
-                    Label("Install the browser extension", systemImage: "puzzlepiece.extension.fill")
-                        .font(.headline)
-                    Text("Adds video detection and a “Send to VideoPro” button to any page. Pick your browser — VideoPro opens it and copies the folder path for you.")
-                        .font(.caption).foregroundStyle(.secondary)
-
-                    // Offer the browsers actually on this Mac. Hard-coding "Chrome"
-                    // left Arc/Brave/Edge users with no working path at all.
-                    ForEach(chromium) { b in
-                        Button {
-                            sheetBrowser = b
-                            installed = true
-                        } label: {
-                            Label("Install in \(b.name)", systemImage: "arrow.down.circle.fill")
-                                .frame(maxWidth: .infinity)
-                        }
-                        .buttonStyle(.glassProminent).controlSize(.large)
-                    }
-
-                    if safari != nil {
-                        Button("Using Safari? Enable it there instead") {
-                            state.openSafariExtensionSettings()
-                            installed = true
-                        }
-                        .buttonStyle(.glass).controlSize(.small)
-                        .frame(maxWidth: .infinity)
-                    }
-
-                    if chromium.isEmpty && safari == nil {
-                        Text("No supported browser found. Install Chrome, Arc, Brave, Edge, or use Safari.")
-                            .font(.caption2).foregroundStyle(.orange)
-                    }
-
-                    if installed {
-                        Label("Follow the steps in your browser — this turns green once it connects",
-                              systemImage: state.extensionStatus.connected ? "checkmark.circle.fill" : "info.circle")
-                            .font(.caption2)
-                            .foregroundStyle(state.extensionStatus.connected ? .green : .secondary)
-                    }
+                VStack(alignment: .leading, spacing: 14) {
+                    tip("link", "Paste a link",
+                        "A video, a playlist, a channel, or any page with videos on it. Press ⌘L to jump to the field.")
+                    tip("keyboard", "Or press \(state.hotKeyCombo.displayString) in your browser",
+                        "Grabs the video in the tab you’re watching, without opening VideoPro.")
+                    tip("bookmark", "Or use the bookmarklet",
+                        "For any browser, Firefox included. It’s in Settings → Quick Grab.")
                 }
                 .padding(16)
+                .frame(maxWidth: .infinity, alignment: .leading)
                 .glassEffect(.regular, in: .rect(cornerRadius: 16))
-                .onAppear {
-                    chromium = BrowserScan.chromiumInstalled()
-                    safari = BrowserScan.safariInstalled()
-                }
 
                 Label(state.toolSummary, systemImage: state.toolsReady ? "checkmark.seal.fill" : "exclamationmark.triangle.fill")
                     .font(.caption).foregroundStyle(state.toolsReady ? .green : .orange)
@@ -1356,12 +1226,21 @@ struct OnboardingView: View {
 
                 Button("Get Started", action: onDone)
                     .buttonStyle(.glass).controlSize(.large)
+                    .keyboardShortcut(.defaultAction)
             }
             .padding(28)
         }
         .frame(width: 440, height: 500)
-        .sheet(item: $sheetBrowser) { b in
-            ExtensionInstallSheet(browser: b).environmentObject(state)
+    }
+
+    private func tip(_ symbol: String, _ title: String, _ detail: String) -> some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: symbol).font(.title3).foregroundStyle(.tint).frame(width: 24)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title).font(.headline)
+                Text(detail).font(.caption).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
         }
     }
 }
@@ -1377,28 +1256,13 @@ struct EmptyStateView: View {
                 .font(.system(size: 46))
                 .foregroundStyle(Color.accentColor.gradient)
             Text("No videos yet").font(.title3).fontWeight(.semibold)
-            Text("Find a video in your browser and click **Send to VideoPro**.")
+            Text("Paste a link in the field above — a video, a playlist, a channel, or any page with videos on it.")
                 .font(.callout).foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
+                .frame(maxWidth: 320)
 
-            Divider().frame(width: 200).padding(.vertical, 4)
-
-            Text("Set up the browser extension")
-                .font(.caption).foregroundStyle(.secondary)
-            HStack(spacing: 10) {
-                // Only offer browsers that exist on this Mac.
-                ForEach(BrowserScan.chromiumInstalled()) { b in
-                    Button { state.setUpExtension(in: b) } label: {
-                        Label(b.name, systemImage: "puzzlepiece.extension.fill")
-                    }
-                }
-                if BrowserScan.safariInstalled() != nil {
-                    Button { state.openSafariExtensionSettings() } label: {
-                        Label("Safari", systemImage: "safari.fill")
-                    }
-                }
-            }
-            .buttonStyle(.glass)
+            Text("Or press \(state.hotKeyCombo.displayString) while a video plays in your browser.")
+                .font(.caption).foregroundStyle(.tertiary)
         }
         .padding(40)
         .glassEffect(.regular, in: .rect(cornerRadius: 24))

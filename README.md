@@ -1,88 +1,79 @@
 # VideoPro
 
-Find videos in your browser, then **play or download** them with the full power of
-[yt-dlp](https://github.com/yt-dlp/yt-dlp) + ffmpeg — from a native macOS app.
-
-VideoPro is two pieces that talk over a tiny loopback bridge:
+Download video and audio from the web with the full power of
+[yt-dlp](https://github.com/yt-dlp/yt-dlp) + ffmpeg — then clip, convert or join it —
+from a native macOS app.
 
 ```
-┌─ Chrome: lite extension ──────────┐        ┌─ VideoProApp (native SwiftUI) ──────────┐
-│ • detects videos on any page      │        │ • local HTTP server ← 127.0.0.1:8787    │
-│ • pop-out focus player (⌘⇧Y)      │        │ • download queue (yt-dlp + ffmpeg)      │
-│ • "Send to VideoPro" ─────────────┼─POST──▶│ • play (AVKit) · thumbnails · convert   │
-│ • real DRM (EME) detection        │  JSON  │ • paste-a-URL · notifications · badge   │
-└───────────────────────────────────┘        └─────────────────────────────────────────┘
+┌─ VideoProApp (native SwiftUI) ───────────────────────────────────────────┐
+│  one field: paste a link → see what's there → download                   │
+│  ⌃⌥⌘D / menu bar: grab the video in your browser's front tab             │
+│  bookmarklet: send the page you're on, from any browser                  │
+│                                                                          │
+│  download queue (yt-dlp) · pause/resume · library · editor (ffmpeg)      │
+└──────────────────────────────────────────────────────────────────────────┘
 ```
-
-A native app can bundle and run yt-dlp/ffmpeg directly — real muxed 1080p/4K, every
-site yt-dlp supports, no browser-store policy risk — while the extension keeps the one
-thing only a browser can do: see the video playing on the current page.
 
 ## Features
 
-**Mac app**
-- Receives videos from the extension over a loopback HTTP bridge
-- **Download queue** with a concurrency limit; **persistent history** (survives relaunch)
-- **Quality picker** per video (Best · MP4/H.264 · 2160–480p · Audio-only), probed live
-- Embeds **thumbnail + subtitles + metadata**; prefers H.264/AAC for universal playback
-- **Play** in-app (AVKit) — pre-warmed on arrival, so it opens instantly
-- **Clip · GIF · MP3** from any video, downloaded or not: a clip fetches only the
-  section you asked for, MP3 fetches audio-only
-- **Paste a URL** to grab a video without the extension
-- Completion **notifications** + Dock badge; **Liquid Glass** UI (macOS 26+)
-- First-launch **onboarding** that installs the extension for you
+**Getting videos in**
+- **One field for links and searches.** Paste a link and it shows what's there before
+  anything downloads: a single video with every quality and its size, or every video
+  on a playlist, channel or page in a grid — pick some or all, choose a quality, and
+  download them together. Anything that isn't a link searches your library.
+- **Copied links wait for you** — come back to VideoPro and a link you copied elsewhere
+  is already in the field (Settings → General). **⇧⌘V** downloads it without looking.
+- **Global shortcut (⌃⌥⌘D)** and **menu bar** grab the video in the browser tab you
+  were last in (Safari, Chrome, Arc, Brave, Edge, Vivaldi, Opera).
+- **Bookmarklet** for any browser, Firefox included (Settings → Quick Grab). Only your
+  own bookmarklet can start a download; any other `videopro://` link just fills the field.
+- **Sign-in cookies** (opt-in) for private, members-only and age-restricted videos.
 
-**Extension**
-- Detects `<video>` elements + sniffs HLS/DASH/direct media (collapses adaptive variants)
-- **Pop-out focus player**: theater view with custom controls (scrub, speed, PiP, fullscreen)
-- **Real DRM detection** via EME (`encrypted` event / `mediaKeys`) — no domain guessing
-- Toolbar **badge** with the video count; **⌘⇧Y** hotkey to pop out the active video
-- **Auto-launches the app** (via `videopro://`) if it isn't running when you Send
-- Remembers what you've already sent
-- **Works in Safari**, which blocks extensions from reaching `127.0.0.1`: sends fall
-  back to handing the payload to the app through the `videopro://` URL scheme
+**Downloading**
+- **Pause and resume**, per download or all at once (⌥⌘P / ⌥⌘R). Quitting stops
+  downloads where they are; they carry on at the next launch.
+- **Download queue** with a concurrency limit and an Activity popover (cancel, history).
+- **Quality picker** per video, probed live; prefers H.264/AAC for universal playback.
+- Embeds **thumbnail + subtitles + metadata**. The Mac stays awake while downloading.
+
+**Library and editing**
+- **Inbox** that tidies itself, **Collections** for what you keep, search, sort,
+  multi-select and batch actions.
+- **Your own files** — drag them in, referenced in place. Media inspector via ffprobe.
+- **Editor**: timeline with in/out handles, crop, rotate, speed, mirror, mute, kept as a
+  recipe; export presets (MP4, 1080p, 720p, Reel 9:16, GIF, MP3, ProRes, "under N MB").
+- **Join a collection** into one video.
 
 ## Repository layout
 
 ```
 VideoProApp/            # native macOS app (Xcode, SwiftUI)
   VideoProApp/
-    VideoProAppApp.swift   # @main, URL-scheme handling
-    AppState.swift         # queue, persistence, convert, extension install
-    LocalServer.swift      # loopback HTTP bridge (Network.framework)
+    VideoProAppApp.swift   # @main, menus, videopro:// handling
+    AppState.swift         # library, queue, pause/resume, persistence
+    LinkProbe.swift        # what's behind a link (yt-dlp -J --flat-playlist)
+    LinkSearch.swift       # the link/search field's state
+    LinkResultsView.swift  # single-video card and the selection grid
     DownloadManager.swift  # yt-dlp/ffmpeg jobs
     Models.swift           # VideoMeta / VideoItem, quality & export enums
-    ContentView.swift      # UI, onboarding, export & quality sheets
+    ContentView.swift      # library UI, onboarding
     AppIcon.icon           # Icon Composer (Liquid Glass) app icon
     Info.plist             # registers the videopro:// URL scheme
 
-extension/              # lite Chrome extension (load this folder unpacked)
-  manifest.json  content.js  focus.js  background.js  popup.{html,css,js}
-
 scripts/
   fetch-binaries.sh    # download yt-dlp + static ffmpeg for bundling
-  bundle-extension.sh  # zip extension/ into the app's Resources
   package-app.sh       # build a self-contained VideoPro.app + DMG
 ```
 
 ## Run it (development)
 
-**App** — needs `yt-dlp` and `ffmpeg`:
+Needs `yt-dlp` and `ffmpeg`, and yt-dlp has to be **current** — YouTube refuses
+downloads from versions a few months old (HTTP 403):
 ```bash
 brew install yt-dlp ffmpeg     # or bundle them (see Distribution)
+brew upgrade yt-dlp            # whenever YouTube downloads start failing
 open VideoProApp/VideoProApp.xcodeproj   # then ⌘R
 ```
-
-**Chrome extension** — `chrome://extensions` → Developer mode → **Load unpacked** →
-select `extension/`. (Or launch the app and use its onboarding / **Settings → Get
-the extension…**.)
-
-**Safari extension** — the app bundles a Safari Web Extension (`VideoProApp/safari/`,
-same code as the Chrome one). Build/run the app, then enable it in **Safari → Settings
-→ Extensions**. After editing `extension/`, run `bash scripts/sync-safari.sh` to keep
-them in sync, then rebuild.
-
-Open a page with a video → click a card to pop it out, or **Send** it to the app.
 
 ## Distribution (self-contained)
 
@@ -107,8 +98,9 @@ Until notarized, recipients right-click → **Open** once to bypass Gatekeeper's
 ## Limitations
 
 - **DRM** (Disney+, Netflix, etc.) can't be downloaded by anything — the decrypted
-  stream lives in a protected buffer. VideoPro flags these `🔒 DRM`; pop-out still works
-  for viewing.
+  stream lives in a protected buffer. VideoPro says so rather than failing quietly.
+- **Pages yt-dlp can't read** have no fallback since the browser extension was removed;
+  a built-in browser that picks up what a page plays is planned.
 - Trim uses stream-copy (instant, snaps to keyframes). Convert re-encodes.
 - Exporting a video you haven't downloaded has to fetch its source first — only
   the requested section for a clip/GIF, audio-only for MP3. Exports from an

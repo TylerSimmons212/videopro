@@ -54,6 +54,10 @@ struct VideoMeta: Codable, Equatable, Identifiable, Sendable {
     /// and revised long after the fact.
     var recipe: EditRecipe? = nil
 
+    /// A download that started and hasn't finished: paused, or cut off by
+    /// quitting. Persisted so it can carry on from where it stopped.
+    var pending: PendingDownload? = nil
+
     /// Decoded by hand so libraries written before these fields existed still
     /// load. Swift's synthesised `Decodable` throws on a missing key even when the
     /// property has a default, so every new field has to be `decodeIfPresent`.
@@ -80,6 +84,7 @@ struct VideoMeta: Codable, Equatable, Identifiable, Sendable {
         probe = try c.decodeIfPresent(MediaInfo.self, forKey: .probe)
         chapters = try c.decodeIfPresent([VideoChapter].self, forKey: .chapters) ?? []
         recipe = try c.decodeIfPresent(EditRecipe.self, forKey: .recipe)
+        pending = try c.decodeIfPresent(PendingDownload.self, forKey: .pending)
     }
 
     init(title: String, pageURL: String, mediaURL: String, sourceKind: String,
@@ -177,6 +182,25 @@ struct VideoChapter: Codable, Equatable, Sendable, Identifiable {
     private enum CodingKeys: String, CodingKey { case id, title, start, end }
 }
 
+/// What it takes to pick a download up again.
+///
+/// yt-dlp writes into `<file>.part` (plus `.ytdl` and `.part-FragN` for
+/// streamed formats) and continues those files when run again with the same
+/// options — so resuming is just running the same download again. What has to
+/// be remembered is *which* options, because a different quality picks
+/// different formats and starts from nothing, and which partial files are ours,
+/// so cancelling can clean them up instead of leaving them in Downloads.
+struct PendingDownload: Codable, Equatable, Sendable {
+    /// `DownloadQuality` raw value.
+    var quality: String
+    /// True when the user paused it. False when quitting interrupted it, which
+    /// means it carries on by itself at the next launch.
+    var paused: Bool
+    var progress: Double = 0
+    /// Files yt-dlp was writing to. Their partial data lives beside them.
+    var partials: [String] = []
+}
+
 // MARK: - Collections
 
 /// A user-made grouping. Ordered, because a collection is also the sequence the
@@ -192,7 +216,11 @@ struct VideoCollection: Codable, Identifiable, Equatable, Sendable {
 // MARK: - Live UI item
 
 enum DownloadStatus: String, Sendable {
-    case idle, queued, downloading, done, error
+    case idle, queued, downloading, paused, done, error
+
+    /// Started and not finished — the states a download can be paused from or
+    /// is waiting to be resumed in.
+    var isUnfinished: Bool { self == .queued || self == .downloading || self == .paused }
 }
 
 // MARK: - Download quality & options
@@ -384,6 +412,12 @@ final class VideoItem: ObservableObject, Identifiable {
     func markError(_ message: String) {
         status = .error
         statusLine = message
+    }
+
+    /// Record a file yt-dlp has started writing for the current download.
+    func notePartial(_ path: String) {
+        guard meta.pending != nil, !(meta.pending?.partials.contains(path) ?? true) else { return }
+        meta.pending?.partials.append(path)
     }
 }
 

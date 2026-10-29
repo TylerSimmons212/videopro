@@ -13,7 +13,7 @@ import Combine
 /// Every tab is a grouped `Form`. Hand-rolled stacks were mixing label-less
 /// pickers, labelled pickers and bare toggles, so nothing shared a label column
 /// and the controls looked randomly indented; `Form` is what gives macOS its
-/// standard aligned layout, and gets it identical on all five tabs for free.
+/// standard aligned layout, and gets it identical on every tab for free.
 struct SettingsView: View {
     @EnvironmentObject var state: AppState
 
@@ -25,8 +25,6 @@ struct SettingsView: View {
                 .tabItem { Label("Downloads", systemImage: "arrow.down.circle") }
             FastPathSettings()
                 .tabItem { Label("Quick Grab", systemImage: "bolt") }
-            ExtensionSetupView()
-                .tabItem { Label("Extension", systemImage: "puzzlepiece.extension") }
             AdvancedSettingsTab()
                 .tabItem { Label("Advanced", systemImage: "wrench.and.screwdriver") }
         }
@@ -64,6 +62,14 @@ private struct GeneralSettingsTab: View {
                 // The single most important thing to say about this setting: it is
                 // not a delete button.
                 Text("Expiry removes the library entry only. Files you’ve downloaded stay on disk, untouched.")
+                    .font(.caption).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            Section {
+                Toggle("Offer links you copy", isOn: $state.offerCopiedLinks)
+            } footer: {
+                Text("When you come back to VideoPro, a link you copied in another app is waiting in the field, ready to download.")
                     .font(.caption).foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
@@ -129,33 +135,6 @@ private struct AdvancedSettingsTab: View {
                     .foregroundStyle(state.toolsReady ? .green : .orange)
                     .fixedSize(horizontal: false, vertical: true)
             }
-
-            Section {
-                Toggle(isOn: $state.serverEnabled) {
-                    Text("Accept videos from the browser extension")
-                }
-                if state.serverEnabled {
-                    HStack(spacing: 7) {
-                        Circle()
-                            .fill(state.serverRunning ? Color.green : Color.orange)
-                            .frame(width: 8, height: 8)
-                        Text(state.serverRunning
-                             ? "Listening on 127.0.0.1:\(state.port)"
-                             : state.serverStatus)
-                            .font(.caption).foregroundStyle(.secondary)
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
-                }
-            } header: {
-                Text("Local connection")
-            } footer: {
-                // Say plainly what leaving it on costs, without melodrama.
-                Text(state.serverEnabled
-                     ? "While this is on, VideoPro listens on a local port. It can't tell an extension request apart from one made by a page you're visiting, so leave it off unless you use the extension."
-                     : "Off. The global shortcut, the menu bar and dragging files in all work without it — only the browser extension needs it.")
-                    .font(.caption).foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
         }
         .settingsForm()
     }
@@ -167,6 +146,7 @@ private struct AdvancedSettingsTab: View {
 struct FastPathSettings: View {
     @EnvironmentObject var state: AppState
     @State private var browsers: [BrowserTarget] = []
+    @State private var copiedBookmarklet = false
 
     var body: some View {
         Form {
@@ -194,6 +174,23 @@ struct FastPathSettings: View {
             }
 
             Section {
+                LabeledContent {
+                    Button(copiedBookmarklet ? "Copied" : "Copy Bookmarklet") {
+                        NSPasteboard.general.clearContents()
+                        NSPasteboard.general.setString(state.bookmarklet, forType: .string)
+                        copiedBookmarklet = true
+                    }
+                } label: {
+                    Text("Bookmarklet")
+                    Text("Sends the page you’re on to VideoPro, from any browser")
+                }
+            } footer: {
+                Text("Make a bookmark in your bookmarks bar and paste this as its address. Click it on a page with a video: a single video starts downloading, a playlist opens for picking. Works in Firefox, which the shortcut can’t read.")
+                    .font(.caption).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            Section {
                 Picker("Sign-in cookies", selection: $state.cookieBrowserID) {
                     Text("Don’t use cookies").tag(String?.none)
                     ForEach(browsers) { b in
@@ -211,102 +208,5 @@ struct FastPathSettings: View {
         }
         .settingsForm()
         .onAppear { browsers = BrowserScan.installed().filter { $0.cookieSpec != nil } }
-    }
-}
-
-// MARK: - Extension setup
-
-/// Lists the browsers actually installed on this Mac and sets the extension up in
-/// the one you pick.
-///
-/// The extension is a fallback now, not the way in — the hotkey, the menu bar and
-/// paste all work without it. It earns its keep on sites that hide their media
-/// behind a player the downloader can't see, so this tab leads with *when* you'd
-/// want it rather than pushing anyone through setup.
-///
-/// The old flow hard-coded "Chrome" and told you to open `chrome://extensions` —
-/// useless if you don't have Chrome (Arc, Brave and Edge users got no working path
-/// at all). It also never told you whether setup had actually worked.
-struct ExtensionSetupView: View {
-    @EnvironmentObject var state: AppState
-    @State private var chromium: [BrowserTarget] = []
-    @State private var safari: BrowserTarget?
-    @State private var sheetBrowser: BrowserTarget?
-    /// Ticks so "last seen" stays honest while the window is open.
-    @State private var now = Date()
-    private let tick = Timer.publish(every: 5, on: .main, in: .common).autoconnect()
-
-    var body: some View {
-        Form {
-            Section {
-                // Say plainly whether it's working — no guessing.
-                HStack(spacing: 7) {
-                    Circle()
-                        .fill(state.extensionStatus.connected ? Color.green : Color.secondary.opacity(0.5))
-                        .frame(width: 8, height: 8)
-                    Text(state.extensionStatus.text).font(.caption)
-                        .foregroundStyle(state.extensionStatus.connected ? .primary : .secondary)
-                }
-            } header: {
-                Text("Optional — for awkward sites")
-            } footer: {
-                Text("VideoPro doesn’t need the extension. Use the global shortcut, the menu bar, or paste a link. Install this only if a site hides its video from the downloader.")
-                    .font(.caption).foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-
-            Section {
-                if chromium.isEmpty && safari == nil {
-                    Text("No supported browser found.")
-                        .font(.caption).foregroundStyle(.secondary)
-                }
-
-                ForEach(chromium) { b in
-                    browserRow(
-                        name: b.name,
-                        detail: "Guided setup — takes about 20 seconds",
-                        action: { sheetBrowser = b },
-                        label: "Set up…"
-                    )
-                }
-
-                if let s = safari {
-                    browserRow(
-                        name: s.name,
-                        detail: "Enable in Safari’s Extensions settings",
-                        action: { state.openSafariExtensionSettings() },
-                        label: "Enable…"
-                    )
-                }
-            } header: {
-                Text("Browsers")
-            } footer: {
-                Text(state.extensionFolder.path)
-                    .font(.system(size: 9, design: .monospaced))
-                    .foregroundStyle(.tertiary)
-                    .lineLimit(1).truncationMode(.middle)
-                    .textSelection(.enabled)
-            }
-        }
-        .settingsForm()
-        .onAppear {
-            chromium = BrowserScan.chromiumInstalled()
-            safari = BrowserScan.safariInstalled()
-        }
-        .onReceive(tick) { now = $0 }
-        .sheet(item: $sheetBrowser) { b in
-            ExtensionInstallSheet(browser: b).environmentObject(state)
-        }
-    }
-
-    @ViewBuilder
-    private func browserRow(name: String, detail: String,
-                            action: @escaping () -> Void, label: String) -> some View {
-        LabeledContent {
-            Button(label, action: action)
-        } label: {
-            Text(name)
-            Text(detail)
-        }
     }
 }

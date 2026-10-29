@@ -184,11 +184,54 @@ by scrubbing. Recoverable from git history if it's ever worth revisiting.
 Two things from it were kept, because they were real bugs rather than feature code:
 the `--sub-langs` fix (see debt list) and the paced subtitle requests.
 
+### M8 — Link field, pause/resume, extension removed — **DONE**
+
+Downloader parity with Downbit, built on yt-dlp rather than a rewrite.
+
+- **One field for links and searches.** `yt-dlp -J --flat-playlist` says what a link
+  is in a second or two: one video (with each quality's real resolution, codec and
+  size) or a list. Lists show as a grid to pick from; channels come back as their
+  tabs (Videos, Live, Shorts); "Load More" pages through with `--playlist-items`.
+  Not-a-link text searches the library.
+- **Copied links** are offered on activation. The pasteboard's pattern detection is
+  checked first, so the paste-privacy prompt can only appear when there's a link.
+- **Pause/resume** by running the same yt-dlp command again over its `.part` files.
+  `--no-part` had to go — with it a stopped download left a truncated file under the
+  final name that the next attempt took as finished. Quitting suspends downloads and
+  the next launch resumes them; cancel deletes the partials.
+- **The browser extension, its Safari target and the loopback server are gone.** The
+  link field, the front-tab shortcut and a bookmarklet (`videopro://download`, gated
+  by a per-install secret) cover what it did. The one thing lost is a fallback for
+  pages yt-dlp can't read — a built-in browser is the replacement.
+
+Findings worth keeping: the capped presets prefer H.264 over resolution, so on YouTube
+"2160p (4K)" yields 1080p; the link field labels each choice with what it really gets,
+but the old quality menu still says 2160p. And a format with no codec listed (any
+direct file link) means *unknown*, not *none* — treating it as none made a plain MP4
+look audio-only.
+
+### Next
+
+- Built-in browser (WKWebView) that lists the media a page plays, for pages yt-dlp
+  can't read; its sign-ins exported as a cookie file for `--cookies`.
+- Playlist options beyond the grid: subscriptions (`--download-archive`), live
+  recording, SponsorBlock, more formats, file-name templates.
+- Bundle a JavaScript runtime (Deno) for yt-dlp's YouTube challenge solving.
+- Pin yt-dlp/ffmpeg downloads to checksums in `fetch-binaries.sh`.
+
 ---
 
 ## Folded-in debt
 
 Fixed:
+
+- The loopback server accepted any origin and let any page start yt-dlp — removed
+  with the extension. Every yt-dlp call now passes the address after `--`.
+- `unpackExtension()` deleted the folder Chromium was loading from — removed.
+- `start()` ran again whenever a closed window reopened, reloading the library over
+  live downloads. It now runs once.
+- Removing an item mid-download left yt-dlp running; it now stops it.
+- ⌘A shadowed select-all in the search field; it now stands aside while the field has focus.
 
 - Download preferences were never persisted — reset on every launch.
 - Generated thumbnails were never cleaned up; `remove()` now prunes them.
@@ -203,13 +246,8 @@ Fixed:
 
 Still outstanding:
 
-- **Loopback server accepts any origin** (`Access-Control-Allow-Origin: *`, no
-  Host check) and auto-spawns yt-dlp against URLs any visited page can supply.
-  Needs a token + origin allowlist, or removal along with the extension.
-- `unpackExtension()` deletes the folder Chromium is actively loading from.
 - `moveToApplications` destroys an existing install before the copy succeeds.
 - `toolSummary` never mentions ffprobe, so a missing one is unexplained.
-- ⌘A is registered scene-wide and may shadow select-all in the search field.
 
 ## Non-goals
 
